@@ -1,0 +1,107 @@
+{
+  "theme": "light/dark toggle",
+  "design_archetype": "Swiss & High-Contrast mixed with Organic & Earthy",
+  "mood": "Professional, Authoritative, Clear, Focused",
+  "colors": {
+    "primary": {
+      "light": "#059669",
+      "dark": "#10B981",
+      "name": "Emerald Green",
+      "description": "Used for main actions, active states, and successful metrics."
+    },
+    "background": {
+      "light": "#F8FAFC",
+      "dark": "#020617",
+      "name": "Slate Background",
+      "description": "App background. Keeps the UI neutral so schedules and data stand out."
+    },
+    "surface": {
+      "light": "#FFFFFF",
+      "dark": "#0F172A",
+      "name": "Card Surface",
+      "description": "For matrices, tables, and summary cards. Must have a subtle 1px border (#E2E8F0 in light, #1E293B in dark)."
+    },
+    "status": {
+      "conflict": "#EF4444",
+      "conflict_bg": "rgba(239, 68, 68, 0.1)",
+      "break_marker": "#F59E0B",
+      "friday_prayer": "#0EA5E9",
+      "available": "#10B981",
+      "unavailable": "#64748B"
+    }
+  },
+  "typography": {
+    "headings": {
+      "font": "Work Sans, sans-serif",
+      "weights": ["600", "700"],
+      "tracking": "tight"
+    },
+    "body": {
+      "font": "IBM Plex Sans, sans-serif",
+      "weights": ["400", "500"]
+    },
+    "mono": {
+      "font": "IBM Plex Mono, monospace",
+      "description": "Used for timeslots and room codes."
+    }
+  },
+  "layouts": {
+    "dashboard_grid": "High Density Grid (Mode B). grid-cols-1 md:grid-cols-2 lg:grid-cols-4 with gap-4 or gap-6. Summary cards at the top, followed by wide conflict resolution tables.",
+    "schedule_matrix": "Interactive grid matrix using CSS Subgrid or strict fixed table layouts to ensure time slots align vertically and horizontally. Must allow horizontal scrolling on smaller screens.",
+    "sidebar": "Fixed left sidebar for navigation on desktop, standard bottom nav or hamburger menu on mobile.",
+    "spacing": "Dense inside tables (p-2 or p-3), but generous around containers (p-6 or p-8). Avoid cramming the outer edges."
+  },
+  "components": {
+    "cards": "Flat solid surfaces. No heavy drop shadows. 1px solid border (border-slate-200/border-slate-800).",
+    "buttons": "Slightly rounded corners (rounded-md). Solid Emerald for primary CTA, outline slate for secondary.",
+    "matrix_cells": "Interactive cells should have subtle hover states (bg-slate-100/bg-slate-800) and clear focus rings (ring-2 ring-emerald-500).",
+    "conflict_alerts": "Red left-border (border-l-4 border-red-500) on cards or cells containing a scheduling conflict. Highly visible.",
+    "drag_drop": "Use @dnd-kit/core. While dragging, the element must scale up slightly (scale-105) and gain a drop shadow (shadow-lg) to indicate 'lift'."
+  },
+  "motion": {
+    "micro_interactions": "Hover states on all buttons and table rows (bg-opacity changes).",
+    "transitions": "Use specific transitions (e.g., transition-colors duration-200 for backgrounds, transition-transform duration-200 for drag and drop). NEVER use 'transition-all'."
+  },
+  "accessibility": {
+    "contrast": "Ensure white text on Emerald Green meets 4.5:1 ratio. If not, use a darker shade of Emerald for backgrounds containing text.",
+    "focus": "All interactive elements (matrix cells, slots) must have a visible focus ring.",
+    "test_ids": "All interactive elements must include a data-testid attribute (e.g., data-testid='auto-schedule-btn', data-testid='matrix-cell-monday-jp1')."
+  },
+  "images": {
+    "login_background": {
+      "url": "https://images.unsplash.com/photo-1763386599933-5a6fd4bf96d5?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2ODh8MHwxfHNlYXJjaHwxfHxjbGVhbiUyMG1pbmltYWwlMjBnZW9tZXRyaWMlMjBiYWNrZ3JvdW5kJTIwZ3JlZW4lMjBlbWVyYWxkfGVufDB8fHx8MTc4NzgxNDU1OXww&ixlib=rb-4.1.0&q=85",
+      "description": "Dark green subtle gradient background, perfect for the authentication page to establish the Islamic educational vibe without being cliché."
+    }
+  },
+  "icons": {
+    "library": "lucide-react",
+    "usage": "Use icons for sidebar navigation, conflict indicators (AlertTriangle), and status indicators (CheckCircle, XCircle)."
+  },
+  "instructions_to_main_agent": [
+    "Ensure Shadcn UI components are installed: Card, Button, Table, Badge, Tabs, Dialog, Form, Input, Select.",
+    "Install @dnd-kit/core, @dnd-kit/sortable, and @dnd-kit/utilities for the drag-and-drop schedule matrix.",
+    "Create a toggle mechanism (Available / Unavailable / Request) inside the Teacher Availability Matrix using custom Shadcn toggles or grouped buttons.",
+    "For the Schedule Builder matrix, use a sticky header for the time slots and a sticky first column for the days or classes, ensuring it remains navigable when heavily populated.",
+    "Implement real-time visual alerts (red highlights, badge counters) for conflicts. The Conflict Engine UI should explicitly explain the conflict (e.g., 'Teacher X double-booked' or 'Violates post-Dhuhr restriction').",
+    "Integrate printing/PDF export functionality via a library like react-to-print or window.print() styled with @media print.",
+    "Do NOT use complete transparent backgrounds for any dropdowns or dialogs. Always use a solid or highly opaque blurred background.",
+    "Prioritize optical alignment inside the schedule matrix.",
+    "DO NOT apply universal transition (transition-all). Avoid generic center-align layouts. Prioritize left-alignment for data readability."
+  ],
+  "UNIVERSAL_GUIDELINES_FOR_MAIN_AGENT": [
+    "Do not converge toward generic, 'on distribution' outputs. Avoid the 'AI slop' aesthetic.",
+    "Dark colors look good when used independently without gradients. DO NOT use dark colors as gradients.",
+    "Don't make generic centered layouts, simplistic gradients, and uniform styling.",
+    "Create depth through layered design elements with z-index hierarchy and subtle borders.",
+    "You MUST NOT apply universal transition. Eg: transition: all. This results in breaking transforms. Always add transitions for specific interactive elements.",
+    "You MUST NOT center align the app container, ie do not add '.App { text-align: center; }' in the css file.",
+    "Always use modern button styles.",
+    "NEVER use AI assistant Emoji characters like \ud83e\udd16\ud83e\udde0\ud83d\udcad\ud83d\udca1\ud83d\udd2e\ud83c\udfaf etc for icons.",
+    "Every interaction needs micro-animations - hover states, transitions. Static = dead.",
+    "Use 2-3x more spacing than feels comfortable. Cramped designs look cheap.",
+    "Subtle grain textures, custom selection states, and loading animations separate good from extraordinary.",
+    "Prioritize using pre-existing components from src/components/ui when applicable.",
+    "All interactive and key informational elements MUST include a data-testid attribute to facilitate robust automated testing.",
+    "Use sonner for toasts, located in /app/src/components/ui/sonner.js or .tsx"
+  ]
+}

@@ -1,0 +1,132 @@
+@import url("https://fonts.googleapis.com/css2?family=Work+Sans:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+    margin: 0;
+    font-family: "IBM Plex Sans", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: #f8fafc;
+    color: #0f172a;
+}
+
+h1, h2, h3, h4, h5 {
+    font-family: "Work Sans", sans-serif;
+    letter-spacing: -0.01em;
+}
+
+.font-mono, code {
+    font-family: "IBM Plex Mono", monospace;
+}
+
+@layer base {
+    :root {
+        --background: 210 40% 98%;
+        --foreground: 222 47% 11%;
+        --card: 0 0% 100%;
+        --card-foreground: 222 47% 11%;
+        --popover: 0 0% 100%;
+        --popover-foreground: 222 47% 11%;
+        --primary: 160 84% 30%;
+        --primary-foreground: 0 0% 100%;
+        --secondary: 210 40% 96%;
+        --secondary-foreground: 222 47% 11%;
+        --muted: 210 40% 96%;
+        --muted-foreground: 215 16% 47%;
+        --accent: 160 84% 39%;
+        --accent-foreground: 0 0% 100%;
+        --destructive: 0 84% 60%;
+        --destructive-foreground: 0 0% 100%;
+        --border: 214 32% 91%;
+        --input: 214 32% 91%;
+        --ring: 160 84% 30%;
+        --radius: 0.5rem;
+    }
+}
+
+@layer base {
+    * {
+        @apply border-border;
+    }
+    body {
+        @apply bg-background text-foreground;
+    }
+}
+
+/* Matrix cell states */
+.cell-available {
+    background: #ecfdf5;
+    color: #065f46;
+}
+.cell-unavailable {
+    background: #f1f5f9;
+    color: #64748b;
+}
+.cell-conflict {
+    background: rgba(239, 68, 68, 0.12);
+    border-left: 4px solid #ef4444;
+}
+.cell-break {
+    background: repeating-linear-gradient(
+        45deg,
+        #fef3c7,
+        #fef3c7 6px,
+        #fde68a 6px,
+        #fde68a 12px
+    );
+    color: #92400e;
+}
+.cell-friday-prayer {
+    background: repeating-linear-gradient(
+        45deg,
+        #e0f2fe,
+        #e0f2fe 6px,
+        #bae6fd 6px,
+        #bae6fd 12px
+    );
+    color: #075985;
+}
+
+/* Text selection */
+::selection {
+    background: #059669;
+    color: #ffffff;
+}
+
+/* Scroll for matrix */
+.matrix-scroll {
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+.matrix-scroll::-webkit-scrollbar {
+    height: 8px;
+}
+.matrix-scroll::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 4px;
+}
+
+/* Print styles */
+@media print {
+    .no-print {
+        display: none !important;
+    }
+    .print-container {
+        padding: 0 !important;
+        background: white !important;
+    }
+    body {
+        background: white !important;
+    }
+}
+
+/* Login backdrop */
+.login-hero {
+    background:
+        linear-gradient(135deg, rgba(2, 44, 34, 0.85) 0%, rgba(6, 78, 59, 0.85) 100%),
+        url("https://images.unsplash.com/photo-1763386599933-5a6fd4bf96d5?crop=entropy&cs=srgb&fm=jpg&w=1600&q=80")
+            center/cover;
+}

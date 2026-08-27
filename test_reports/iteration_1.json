@@ -1,0 +1,23 @@
+{
+  "summary": "Backend smoke pass for EduSchedule AI. 24/24 checks passed across auth, seed idempotency, CRUD (teachers/subjects/classes/assignments), schedule upsert semantics, conflict engine, greedy auto-scheduler constraints (availability + Friday JP9-10), and dashboard stats.",
+  "tested_scope": ["backend", "auth", "integration"],
+  "passed": [
+    "GET /api/auth/me: 401 without token, 200 with Bearer TEST_OWNER_TOKEN",
+    "POST /api/seed idempotent; creates 6 teachers, 8 subjects, 6 classes",
+    "Hasan Nasrulloh availability: Wednesday & Thursday all-day unavailable + Monday JP1-2 unavailable",
+    "Teachers/Subjects/Classes/Assignments CRUD (create/update/delete) working",
+    "POST /api/schedule enforces class-owns-slot (replaces existing class+day+slot)",
+    "GET /api/schedule/conflicts detects teacher_double_booked and availability_violation",
+    "POST /api/schedule/auto respects teacher unavailability, never double-books, never places Friday JP9/10",
+    "GET /api/dashboard/stats returns total_teachers=6, total_classes=6, completion_rate correctly computed",
+    "POST /api/schedule/clear empties the schedule collection"
+  ],
+  "failed": [],
+  "notes": [
+    "class_double_booked conflict type: detection code is present in server.detect_conflicts(), but upsert on POST /api/schedule prevents two schedule docs from sharing class+day+slot in normal flow, so it is unreachable through the public API. Detection logic itself was code-reviewed and matches teacher_double_booked pattern. Not a blocker."
+  ],
+  "action_items": [],
+  "success_rate": {"backend": "100%", "frontend": "n/a (skipped per request)"},
+  "retest_needed": false,
+  "full_testing_deferred": true
+}
