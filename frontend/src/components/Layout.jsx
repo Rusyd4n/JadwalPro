@@ -1,15 +1,46 @@
 import { useNavigate, useLocation } from "react-router-dom";
-import { LayoutDashboard, Users, Calendar, ClipboardList, Grid3x3, Eye, LogOut, GraduationCap } from "lucide-react";
+import {
+  LayoutDashboard, Users, Calendar, ClipboardList, Grid3x3, Eye, LogOut,
+  GraduationCap, BookOpen, Users2, Settings2,
+} from "lucide-react";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
 
-const NAV = [
-  { path: "/dashboard", label: "Dashboard", icon: LayoutDashboard, testid: "nav-dashboard" },
-  { path: "/teachers", label: "Data Guru", icon: Users, testid: "nav-teachers" },
-  { path: "/availability", label: "Availability Matrix", icon: Grid3x3, testid: "nav-availability" },
-  { path: "/assignments", label: "Teaching Load", icon: ClipboardList, testid: "nav-assignments" },
-  { path: "/schedule", label: "Schedule Builder", icon: Calendar, testid: "nav-schedule" },
-  { path: "/views", label: "Views & Export", icon: Eye, testid: "nav-views" },
+const NAV_GROUPS = [
+  {
+    label: null,
+    items: [
+      { path: "/dashboard", label: "Dashboard", icon: LayoutDashboard, testid: "nav-dashboard" },
+    ],
+  },
+  {
+    label: "Data Master",
+    items: [
+      { path: "/teachers", label: "Guru", icon: Users, testid: "nav-teachers" },
+      { path: "/subjects", label: "Mata Pelajaran", icon: BookOpen, testid: "nav-subjects" },
+      { path: "/classes", label: "Kelas", icon: Users2, testid: "nav-classes" },
+    ],
+  },
+  {
+    label: "Penjadwalan",
+    items: [
+      { path: "/availability", label: "Availability Matrix", icon: Grid3x3, testid: "nav-availability" },
+      { path: "/assignments", label: "Teaching Load", icon: ClipboardList, testid: "nav-assignments" },
+      { path: "/schedule", label: "Schedule Builder", icon: Calendar, testid: "nav-schedule" },
+    ],
+  },
+  {
+    label: "Output",
+    items: [
+      { path: "/views", label: "Views & Export", icon: Eye, testid: "nav-views" },
+    ],
+  },
+  {
+    label: "Sistem",
+    items: [
+      { path: "/config", label: "Konfigurasi", icon: Settings2, testid: "nav-config" },
+    ],
+  },
 ];
 
 export default function Layout({ user, children }) {
@@ -30,31 +61,40 @@ export default function Layout({ user, children }) {
               <GraduationCap size={20} className="text-white" />
             </div>
             <div>
-              <div className="text-white font-semibold tracking-tight">EduSchedule AI</div>
+              <div className="text-white font-semibold tracking-tight">JadwalPro</div>
               <div className="text-[11px] text-slate-400">MA Persis Katapang</div>
             </div>
           </div>
         </div>
-        <nav className="flex-1 py-4 px-3 space-y-1">
-          {NAV.map((item) => {
-            const active = location.pathname === item.path;
-            const Icon = item.icon;
-            return (
-              <button
-                key={item.path}
-                data-testid={item.testid}
-                onClick={() => navigate(item.path)}
-                className={`w-full text-left px-3 py-2.5 rounded-md flex items-center gap-3 text-sm transition-colors duration-150 ${
-                  active
-                    ? "bg-emerald-600 text-white"
-                    : "text-slate-300 hover:bg-slate-800 hover:text-white"
-                }`}
-              >
-                <Icon size={16} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
+        <nav className="flex-1 py-3 px-3 space-y-3 overflow-y-auto">
+          {NAV_GROUPS.map((group, gi) => (
+            <div key={gi}>
+              {group.label && (
+                <div className="px-3 text-[10px] font-semibold uppercase tracking-wider text-slate-500 mb-1 mt-2">
+                  {group.label}
+                </div>
+              )}
+              {group.items.map((item) => {
+                const active = location.pathname === item.path;
+                const Icon = item.icon;
+                return (
+                  <button
+                    key={item.path}
+                    data-testid={item.testid}
+                    onClick={() => navigate(item.path)}
+                    className={`w-full text-left px-3 py-2 rounded-md flex items-center gap-3 text-sm transition-colors duration-150 ${
+                      active
+                        ? "bg-emerald-600 text-white"
+                        : "text-slate-300 hover:bg-slate-800 hover:text-white"
+                    }`}
+                  >
+                    <Icon size={15} />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ))}
         </nav>
         <div className="p-3 border-t border-slate-800">
           <div className="flex items-center gap-3 px-3 py-2">

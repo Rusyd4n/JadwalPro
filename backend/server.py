@@ -85,6 +85,70 @@ class SessionData(BaseModel):
     session_id: str
 
 
+class PeriodItem(BaseModel):
+    type: str  # "period" | "break"
+    label: str
+    duration_min: int = 40
+
+
+class DayConfig(BaseModel):
+    id: str = Field(default_factory=lambda: new_id("dcfg"))
+    day: str
+    start_time: str = "07:00"
+    items: List[PeriodItem] = Field(default_factory=list)
+
+
+DEFAULT_ITEMS_REGULAR = [
+    {"type": "period", "label": "JP 1", "duration_min": 40},
+    {"type": "period", "label": "JP 2", "duration_min": 40},
+    {"type": "period", "label": "JP 3", "duration_min": 40},
+    {"type": "period", "label": "JP 4", "duration_min": 40},
+    {"type": "break", "label": "Istirahat 1", "duration_min": 20},
+    {"type": "period", "label": "JP 5", "duration_min": 40},
+    {"type": "period", "label": "JP 6", "duration_min": 40},
+    {"type": "period", "label": "JP 7", "duration_min": 40},
+    {"type": "period", "label": "JP 8", "duration_min": 40},
+    {"type": "break", "label": "Istirahat 2", "duration_min": 30},
+    {"type": "period", "label": "JP 9", "duration_min": 40},
+    {"type": "period", "label": "JP 10", "duration_min": 40},
+]
+DEFAULT_ITEMS_FRIDAY = [
+    {"type": "period", "label": "JP 1", "duration_min": 40},
+    {"type": "period", "label": "JP 2", "duration_min": 40},
+    {"type": "period", "label": "JP 3", "duration_min": 40},
+    {"type": "period", "label": "JP 4", "duration_min": 40},
+    {"type": "break", "label": "Istirahat 1", "duration_min": 20},
+    {"type": "period", "label": "JP 5", "duration_min": 40},
+    {"type": "period", "label": "JP 6", "duration_min": 40},
+    {"type": "break", "label": "Sholat Jum'at", "duration_min": 70},
+    {"type": "period", "label": "JP 7", "duration_min": 40},
+    {"type": "period", "label": "JP 8", "duration_min": 40},
+]
+
+
+async def ensure_day_configs():
+    if await db.day_configs.count_documents({}) == 0:
+        docs = []
+        for day in DAYS:
+            docs.append({
+                "id": new_id("dcfg"),
+                "day": day,
+                "start_time": "07:00",
+                "items": DEFAULT_ITEMS_FRIDAY if day == "Friday" else list(DEFAULT_ITEMS_REGULAR),
+            })
+        await db.day_configs.insert_many(docs)
+
+
+async def get_valid_slots_by_day() -> Dict[str, set]:
+    await ensure_day_configs()
+    configs = await db.day_configs.find({}, {"_id": 0}).to_list(20)
+    result = {}
+    for c in configs:
+        periods = [i for i in c.get("items", []) if i.get("type") == "period"]
+        result[c["day"]] = set(range(1, len(periods) + 1))
+    return result
+
+
 # ---------------- Auth ----------------
 async def get_current_user(request: Request) -> Optional[dict]:
     token = request.cookies.get("session_token")
@@ -310,7 +374,7 @@ def get_valid_slots(day: str) -> List[int]:
     return FRIDAY_SLOTS if day == "Friday" else REGULAR_SLOTS
 
 
-def detect_conflicts(schedule: List[dict], teachers: List[dict]) -> List[dict]:
+def detect_conflicts(schedule: List[dict], teachers: List[dict], valid_slots_by_day: Optional[Dict[str, set]] = None) -> List[dict]:
     conflicts = []
     teacher_map = {t["id"]: t for t in teachers}
     # 1 & 3: teacher & class double-booked
@@ -352,12 +416,15 @@ def detect_conflicts(schedule: List[dict], teachers: List[dict]) -> List[dict]:
                 "class_id": s["class_id"],
                 "message": f"{t['name']} tidak tersedia pada {s['day']} JP{s['slot']}"
             })
-        if s["day"] == "Friday" and s["slot"] not in FRIDAY_SLOTS:
-            conflicts.append({
-                "type": "friday_prayer_violation",
-                "day": s["day"], "slot": s["slot"],
-                "message": f"Jum'at JP{s['slot']} adalah waktu Sholat Jum'at"
-            })
+        if valid_slots_by_day is not None:
+            valid = valid_slots_by_day.get(s["day"])
+            if valid is not None and s["slot"] not in valid:
+                conflicts.append({
+                    "type": "invalid_slot",
+                    "day": s["day"], "slot": s["slot"],
+                    "class_id": s["class_id"],
+                    "message": f"{s['day']} JP{s['slot']} tidak ada dalam konfigurasi hari ini"
+                })
     return conflicts
 
 
@@ -400,7 +467,8 @@ async def get_conflicts(request: Request):
     await require_user(request)
     schedule = await load_all_schedule()
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
-    return detect_conflicts(schedule, teachers)
+    valid = await get_valid_slots_by_day()
+    return detect_conflicts(schedule, teachers, valid)
 
 
 @api_router.post("/schedule/auto")
@@ -410,6 +478,7 @@ async def auto_schedule(request: Request):
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
     assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
     existing = await load_all_schedule()
+    valid_slots_by_day = await get_valid_slots_by_day()
 
     teacher_map = {t["id"]: t for t in teachers}
     # occupancy trackers
@@ -447,7 +516,7 @@ async def auto_schedule(request: Request):
         placed = 0
         # iterate day-slot in order
         for day in DAYS:
-            valid = get_valid_slots(day)
+            valid = sorted(valid_slots_by_day.get(day, set()))
             for slot in valid:
                 if placed >= needed:
                     break
@@ -489,7 +558,8 @@ async def dashboard_stats(request: Request):
     total_classes = await db.classes.count_documents({})
     schedule = await load_all_schedule()
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
-    conflicts = detect_conflicts(schedule, teachers)
+    valid = await get_valid_slots_by_day()
+    conflicts = detect_conflicts(schedule, teachers, valid)
 
     # completion rate: placed_slots / required_slots from assignments
     assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
@@ -637,6 +707,63 @@ async def seed_data(request: Request):
         await db.teachers.insert_many(teachers)
 
     return {"ok": True, "message": "Seed complete"}
+
+
+# ---------------- Day Configs ----------------
+@api_router.get("/day-configs")
+async def list_day_configs(request: Request):
+    await require_user(request)
+    await ensure_day_configs()
+    docs = await db.day_configs.find({}, {"_id": 0}).to_list(20)
+    order = {d: i for i, d in enumerate(DAYS)}
+    docs.sort(key=lambda x: order.get(x["day"], 99))
+    return docs
+
+
+@api_router.put("/day-configs/{day}")
+async def update_day_config(day: str, payload: dict, request: Request):
+    await require_user(request)
+    if day not in DAYS:
+        raise HTTPException(status_code=400, detail="Invalid day")
+    existing = await db.day_configs.find_one({"day": day}, {"_id": 0})
+    doc = {
+        "id": existing["id"] if existing else new_id("dcfg"),
+        "day": day,
+        "start_time": payload.get("start_time", "07:00"),
+        "items": payload.get("items", []),
+    }
+    await db.day_configs.update_one({"day": day}, {"$set": doc}, upsert=True)
+    return doc
+
+
+@api_router.post("/day-configs/{day}/reset")
+async def reset_day_config(day: str, request: Request):
+    await require_user(request)
+    if day not in DAYS:
+        raise HTTPException(status_code=400, detail="Invalid day")
+    items = list(DEFAULT_ITEMS_FRIDAY) if day == "Friday" else list(DEFAULT_ITEMS_REGULAR)
+    doc = {"id": new_id("dcfg"), "day": day, "start_time": "07:00", "items": items}
+    await db.day_configs.update_one({"day": day}, {"$set": doc}, upsert=True)
+    return doc
+
+
+# ---------------- Subject/Class update ----------------
+@api_router.put("/subjects/{subject_id}", response_model=Subject)
+async def update_subject(subject_id: str, payload: Subject, request: Request):
+    await require_user(request)
+    doc = payload.model_dump()
+    doc["id"] = subject_id
+    await db.subjects.update_one({"id": subject_id}, {"$set": doc}, upsert=True)
+    return Subject(**doc)
+
+
+@api_router.put("/classes/{class_id}", response_model=SchoolClass)
+async def update_class(class_id: str, payload: SchoolClass, request: Request):
+    await require_user(request)
+    doc = payload.model_dump()
+    doc["id"] = class_id
+    await db.classes.update_one({"id": class_id}, {"$set": doc}, upsert=True)
+    return SchoolClass(**doc)
 
 
 # ---------------- Health ----------------

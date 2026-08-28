@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef } from "react";
-import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useLocation, useNavigate, Outlet } from "react-router-dom";
 import api from "@/lib/api";
 import { Toaster } from "@/components/ui/sonner";
+import { ConfigProvider } from "@/lib/scheduleConfig";
 
 import Login from "@/pages/Login";
 import Layout from "@/components/Layout";
@@ -11,6 +12,9 @@ import Availability from "@/pages/Availability";
 import Assignments from "@/pages/Assignments";
 import ScheduleBuilder from "@/pages/ScheduleBuilder";
 import Views from "@/pages/Views";
+import Subjects from "@/pages/Subjects";
+import Classes from "@/pages/Classes";
+import Config from "@/pages/Config";
 
 // REMINDER: DO NOT HARDCODE THE URL, OR ADD ANY FALLBACKS OR REDIRECT URLS, THIS BREAKS THE AUTH
 
@@ -32,7 +36,6 @@ function AuthCallback() {
     (async () => {
       try {
         const r = await api.post("/auth/session", { session_id });
-        // Clear the hash for cleanliness
         window.history.replaceState(null, "", "/dashboard");
         navigate("/dashboard", { replace: true, state: { user: r.data.user } });
       } catch (e) {
@@ -48,50 +51,54 @@ function AuthCallback() {
   );
 }
 
-function ProtectedRoute({ children }) {
-  const location = useLocation();
-  const [isAuthenticated, setIsAuthenticated] = useState(location.state?.user ? true : null);
-  const [user, setUser] = useState(location.state?.user || null);
+function ProtectedShell() {
+  const [state, setState] = useState({ auth: null, user: null });
 
   useEffect(() => {
-    if (location.state?.user) return;
     (async () => {
       try {
         const r = await api.get("/auth/me");
-        setUser(r.data);
-        setIsAuthenticated(true);
+        setState({ auth: true, user: r.data });
       } catch (e) {
-        setIsAuthenticated(false);
+        setState({ auth: false, user: null });
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  if (isAuthenticated === null) {
+  if (state.auth === null) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50">
         <div className="text-slate-500 text-sm">Memuat...</div>
       </div>
     );
   }
-  if (!isAuthenticated) return <Navigate to="/login" replace />;
-  return <Layout user={user}>{children}</Layout>;
+  if (!state.auth) return <Navigate to="/login" replace />;
+  return (
+    <ConfigProvider>
+      <Layout user={state.user}>
+        <Outlet />
+      </Layout>
+    </ConfigProvider>
+  );
 }
 
 function AppRouter() {
   const location = useLocation();
-  if (location.hash?.includes("session_id=")) {
-    return <AuthCallback />;
-  }
+  if (location.hash?.includes("session_id=")) return <AuthCallback />;
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
-      <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
-      <Route path="/teachers" element={<ProtectedRoute><Teachers /></ProtectedRoute>} />
-      <Route path="/availability" element={<ProtectedRoute><Availability /></ProtectedRoute>} />
-      <Route path="/assignments" element={<ProtectedRoute><Assignments /></ProtectedRoute>} />
-      <Route path="/schedule" element={<ProtectedRoute><ScheduleBuilder /></ProtectedRoute>} />
-      <Route path="/views" element={<ProtectedRoute><Views /></ProtectedRoute>} />
+      <Route element={<ProtectedShell />}>
+        <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/teachers" element={<Teachers />} />
+        <Route path="/subjects" element={<Subjects />} />
+        <Route path="/classes" element={<Classes />} />
+        <Route path="/availability" element={<Availability />} />
+        <Route path="/assignments" element={<Assignments />} />
+        <Route path="/schedule" element={<ScheduleBuilder />} />
+        <Route path="/views" element={<Views />} />
+        <Route path="/config" element={<Config />} />
+      </Route>
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>

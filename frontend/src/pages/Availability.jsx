@@ -1,12 +1,25 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import api from "@/lib/api";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { DAYS, DAY_ID, SLOTS, FRIDAY_ACTIVE_SLOTS, getSlotTime, isBreakAfter, isFridayPrayerSlot } from "@/lib/constants";
+import { DAYS, DAY_ID } from "@/lib/constants";
+import {
+  useConfig, maxPeriodCount, periodCount, isSlotValid, getSlotTiming, getBreakRow,
+} from "@/lib/scheduleConfig";
 import { toast } from "sonner";
 import { CheckCircle2, XCircle, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
+function emptyAvailabilityFromConfigs(configs) {
+  const av = {};
+  configs.forEach((cfg) => {
+    const count = cfg.items.filter((i) => i.type === "period").length;
+    for (let s = 1; s <= count; s++) av[`${cfg.day}-${s}`] = "available";
+  });
+  return av;
+}
+
 export default function Availability() {
+  const { configs } = useConfig();
   const [teachers, setTeachers] = useState([]);
   const [selectedId, setSelectedId] = useState("");
   const [availability, setAvailability] = useState({});
@@ -22,12 +35,17 @@ export default function Availability() {
 
   useEffect(() => {
     const t = teachers.find((x) => x.id === selectedId);
-    setAvailability(t?.availability || {});
+    // Merge with base to ensure all cells present
+    const base = configs.length ? emptyAvailabilityFromConfigs(configs) : {};
+    setAvailability({ ...base, ...(t?.availability || {}) });
     setDirty(false);
-  }, [selectedId, teachers]);
+  }, [selectedId, teachers, configs]);
+
+  const maxSlots = useMemo(() => maxPeriodCount(configs), [configs]);
+  const rows = useMemo(() => Array.from({ length: maxSlots }, (_, i) => i + 1), [maxSlots]);
 
   const toggle = (day, slot) => {
-    if (isFridayPrayerSlot(day, slot)) return;
+    if (!isSlotValid(configs, day, slot)) return;
     const key = `${day}-${slot}`;
     const current = availability[key] || "available";
     const next = current === "available" ? "unavailable" : "available";
@@ -48,11 +66,15 @@ export default function Availability() {
   };
 
   const selected = teachers.find((x) => x.id === selectedId);
-  const availableCount = Object.values(availability).filter((v) => v === "available").length;
+  const availableCount = Object.entries(availability).filter(([k, v]) => {
+    const [day, slotStr] = k.split("-");
+    const slot = parseInt(slotStr, 10);
+    return v === "available" && isSlotValid(configs, day, slot);
+  }).length;
 
   return (
     <div className="p-8">
-      <div className="flex items-start justify-between mb-6">
+      <div className="flex items-start justify-between mb-6 flex-wrap gap-3">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Availability Matrix</h1>
           <p className="text-sm text-slate-500 mt-1">Klik sel untuk mengubah status ketersediaan guru</p>
@@ -104,55 +126,76 @@ export default function Availability() {
 
           <div className="bg-white border border-slate-200 rounded-lg matrix-scroll">
             <table className="w-full text-sm" data-testid="availability-matrix">
-              <thead className="bg-slate-50 border-b border-slate-200 sticky top-0">
+              <thead className="bg-slate-50 border-b border-slate-200 sticky top-0 z-10">
                 <tr>
-                  <th className="p-2 text-left text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-10">Slot / Hari</th>
+                  <th className="p-2 text-left text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-10">JP / Hari</th>
                   {DAYS.map((d) => (
-                    <th key={d} className="p-2 text-xs uppercase tracking-wide text-slate-500 min-w-[120px]">{DAY_ID[d]}</th>
+                    <th key={d} className="p-2 text-xs uppercase tracking-wide text-slate-500 min-w-[130px]">{DAY_ID[d]}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {SLOTS.map((slot) => (
-                  <>
-                    <tr key={slot} className="border-b border-slate-100">
-                      <td className="p-2 sticky left-0 bg-white border-r border-slate-100">
-                        <div className="font-semibold text-slate-800">JP {slot}</div>
-                      </td>
-                      {DAYS.map((day) => {
-                        const key = `${day}-${slot}`;
-                        const status = availability[key];
-                        const isPrayer = isFridayPrayerSlot(day, slot);
-                        if (isPrayer) {
+                {rows.map((slot) => {
+                  const breakRow = getBreakRow(configs, slot);
+                  return (
+                    <Fragment key={slot}>
+                      <tr className="border-b border-slate-100">
+                        <td className="p-2 sticky left-0 bg-white border-r border-slate-100">
+                          <div className="font-semibold text-slate-800">JP {slot}</div>
+                        </td>
+                        {DAYS.map((day) => {
+                          const valid = isSlotValid(configs, day, slot);
+                          if (!valid) {
+                            return (
+                              <td key={day} className="p-1">
+                                <div className="text-center py-2 text-[11px] text-slate-300">—</div>
+                              </td>
+                            );
+                          }
+                          const key = `${day}-${slot}`;
+                          const status = availability[key];
+                          const timing = getSlotTiming(configs, day, slot);
+                          const cls = status === "unavailable" ? "cell-unavailable" : "cell-available";
                           return (
                             <td key={day} className="p-1">
-                              <div className="cell-friday-prayer text-center py-2 text-[11px] font-medium rounded">Sholat Jum'at</div>
+                              <button
+                                data-testid={`avail-cell-${day}-${slot}`}
+                                onClick={() => toggle(day, slot)}
+                                className={`w-full py-2 rounded text-xs font-medium flex items-center justify-center gap-1 transition-colors duration-150 hover:ring-2 hover:ring-emerald-500 ${cls}`}
+                              >
+                                {status === "unavailable" ? (
+                                  <><XCircle size={12} /> Off</>
+                                ) : (
+                                  <><CheckCircle2 size={12} /> {timing ? `${timing.start_str}` : ""}</>
+                                )}
+                              </button>
                             </td>
                           );
-                        }
-                        const cls = status === "unavailable" ? "cell-unavailable" : "cell-available";
-                        return (
-                          <td key={day} className="p-1">
-                            <button
-                              data-testid={`avail-cell-${day}-${slot}`}
-                              onClick={() => toggle(day, slot)}
-                              className={`w-full py-2 rounded text-xs font-medium flex items-center justify-center gap-1 transition-colors duration-150 hover:ring-2 hover:ring-emerald-500 ${cls}`}
-                            >
-                              {status === "unavailable" ? <><XCircle size={12} /> Unavailable</> : <><CheckCircle2 size={12} /> {getSlotTime(day, slot)}</>}
-                            </button>
-                          </td>
-                        );
-                      })}
-                    </tr>
-                    {isBreakAfter("Monday", slot) && (
-                      <tr key={`break-${slot}`}>
-                        <td colSpan={DAYS.length + 1} className="cell-break text-center text-xs font-medium py-1.5">
-                          {isBreakAfter("Monday", slot)}
-                        </td>
+                        })}
                       </tr>
-                    )}
-                  </>
-                ))}
+                      {breakRow && (
+                        <tr>
+                          <td className="p-1 sticky left-0 bg-slate-50 border-r border-slate-100 text-[10px] text-amber-800 uppercase tracking-wide">Break</td>
+                          {DAYS.map((day) => {
+                            const breaks = breakRow[day] || [];
+                            if (!breaks.length) {
+                              return <td key={day} className="p-1"></td>;
+                            }
+                            return (
+                              <td key={day} className="p-1">
+                                {breaks.map((b, i) => (
+                                  <div key={i} className="cell-break text-center py-1 text-[10px] font-medium rounded">
+                                    {b.label} · {b.duration_min}m
+                                  </div>
+                                ))}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>

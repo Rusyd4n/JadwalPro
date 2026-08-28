@@ -1,22 +1,18 @@
-import { useEffect, useState, useMemo } from "react";
+import { Fragment, useEffect, useState, useMemo } from "react";
 import api from "@/lib/api";
-import { DAYS, DAY_ID, SLOTS, isFridayPrayerSlot, isBreakAfter } from "@/lib/constants";
+import { DAYS, DAY_ID } from "@/lib/constants";
+import {
+  useConfig, maxPeriodCount, isSlotValid, getSlotTiming, getBreakRow,
+} from "@/lib/scheduleConfig";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Sparkles, Trash2, AlertTriangle, X, GripVertical, Info } from "lucide-react";
 import { toast } from "sonner";
 import {
-  DndContext,
-  useDraggable,
-  useDroppable,
-  DragOverlay,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  closestCenter,
+  DndContext, useDraggable, useDroppable, DragOverlay,
+  PointerSensor, useSensor, useSensors, closestCenter,
 } from "@dnd-kit/core";
 
-// ---------------- Draggable pool card ----------------
 function DraggablePoolCard({ assignment, subject, teacher }) {
   const filled = assignment.remaining <= 0;
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
@@ -51,7 +47,6 @@ function DraggablePoolCard({ assignment, subject, teacher }) {
   );
 }
 
-// ---------------- Draggable filled cell ----------------
 function DraggableFilledCell({ cell, subject, teacher, conflict, onClear }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `slot::${cell.id}`,
@@ -82,10 +77,7 @@ function DraggableFilledCell({ cell, subject, teacher, conflict, onClear }) {
       )}
       <button
         onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => {
-          e.stopPropagation();
-          onClear();
-        }}
+        onClick={(e) => { e.stopPropagation(); onClear(); }}
         className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 p-0.5 rounded bg-white hover:bg-red-50 border border-slate-200 transition-opacity duration-150"
         data-testid={`clear-slot-${cell.id}`}
       >
@@ -95,7 +87,6 @@ function DraggableFilledCell({ cell, subject, teacher, conflict, onClear }) {
   );
 }
 
-// ---------------- Droppable wrapper ----------------
 function DroppableCell({ day, slot, disabled, children }) {
   const { setNodeRef, isOver } = useDroppable({
     id: `cell::${day}::${slot}`,
@@ -115,8 +106,8 @@ function DroppableCell({ day, slot, disabled, children }) {
   );
 }
 
-// ---------------- Main ----------------
 export default function ScheduleBuilder() {
+  const { configs } = useConfig();
   const [teachers, setTeachers] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [classes, setClasses] = useState([]);
@@ -131,84 +122,46 @@ export default function ScheduleBuilder() {
 
   const loadAll = async () => {
     const [t, s, c, a, sch, cf] = await Promise.all([
-      api.get("/teachers"),
-      api.get("/subjects"),
-      api.get("/classes"),
-      api.get("/assignments"),
-      api.get("/schedule"),
-      api.get("/schedule/conflicts"),
+      api.get("/teachers"), api.get("/subjects"), api.get("/classes"),
+      api.get("/assignments"), api.get("/schedule"), api.get("/schedule/conflicts"),
     ]);
-    setTeachers(t.data);
-    setSubjects(s.data);
-    setClasses(c.data);
-    setAssignments(a.data);
-    setSchedule(sch.data);
-    setConflicts(cf.data);
+    setTeachers(t.data); setSubjects(s.data); setClasses(c.data);
+    setAssignments(a.data); setSchedule(sch.data); setConflicts(cf.data);
     if (!selectedClassId && c.data[0]) setSelectedClassId(c.data[0].id);
   };
-  useEffect(() => {
-    loadAll();
-    /* eslint-disable-next-line */
-  }, []);
+  useEffect(() => { loadAll(); /* eslint-disable-next-line */ }, []);
 
-  const teacherMap = useMemo(
-    () => Object.fromEntries(teachers.map((t) => [t.id, t])),
-    [teachers]
-  );
-  const subjectMap = useMemo(
-    () => Object.fromEntries(subjects.map((s) => [s.id, s])),
-    [subjects]
-  );
-  const classMap = useMemo(
-    () => Object.fromEntries(classes.map((c) => [c.id, c])),
-    [classes]
-  );
+  const teacherMap = useMemo(() => Object.fromEntries(teachers.map((t) => [t.id, t])), [teachers]);
+  const subjectMap = useMemo(() => Object.fromEntries(subjects.map((s) => [s.id, s])), [subjects]);
+  const classMap = useMemo(() => Object.fromEntries(classes.map((c) => [c.id, c])), [classes]);
+
+  const maxSlots = useMemo(() => maxPeriodCount(configs), [configs]);
+  const rows = useMemo(() => Array.from({ length: maxSlots }, (_, i) => i + 1), [maxSlots]);
 
   const classAssignments = useMemo(() => {
     return assignments
       .filter((a) => a.class_id === selectedClassId)
       .map((a) => {
         const placed = schedule.filter(
-          (s) =>
-            s.class_id === a.class_id &&
-            s.subject_id === a.subject_id &&
-            s.teacher_id === a.teacher_id
+          (s) => s.class_id === a.class_id && s.subject_id === a.subject_id && s.teacher_id === a.teacher_id
         ).length;
         return { ...a, placed, remaining: a.hours_per_week - placed };
       });
   }, [assignments, selectedClassId, schedule]);
 
   const totalRemaining = classAssignments.reduce((s, a) => s + Math.max(0, a.remaining), 0);
-
-  const slotAt = (day, slot) =>
-    schedule.find(
-      (s) => s.class_id === selectedClassId && s.day === day && s.slot === slot
-    );
-
-  const conflictAt = (day, slot) => {
-    return conflicts.find(
-      (c) =>
-        c.day === day &&
-        c.slot === slot &&
-        ((c.class_ids && c.class_ids.includes(selectedClassId)) || c.class_id === selectedClassId)
-    );
-  };
+  const slotAt = (day, slot) => schedule.find((s) => s.class_id === selectedClassId && s.day === day && s.slot === slot);
+  const conflictAt = (day, slot) =>
+    conflicts.find((c) => c.day === day && c.slot === slot && ((c.class_ids && c.class_ids.includes(selectedClassId)) || c.class_id === selectedClassId));
 
   const placeSlot = async ({ class_id, day, slot, subject_id, teacher_id }) => {
     await api.post("/schedule", {
       id: `sch_${Math.random().toString(16).slice(2, 14)}`,
-      class_id,
-      day,
-      slot,
-      subject_id,
-      teacher_id,
+      class_id, day, slot, subject_id, teacher_id,
     });
   };
 
-  const handleDragStart = (event) => {
-    setActiveDrag(event.active.data.current);
-  };
-
+  const handleDragStart = (event) => setActiveDrag(event.active.data.current);
   const handleDragEnd = async (event) => {
     setActiveDrag(null);
     const { active, over } = event;
@@ -216,41 +169,26 @@ export default function ScheduleBuilder() {
     const overData = over.data.current;
     if (!overData || overData.type !== "cell") return;
     const { day, slot } = overData;
-    if (isFridayPrayerSlot(day, slot)) {
-      toast.error("Slot Sholat Jum'at tidak dapat digunakan");
+    if (!isSlotValid(configs, day, slot)) {
+      toast.error(`Slot tidak tersedia pada ${DAY_ID[day]} JP ${slot}`);
       return;
     }
     const activeData = active.data.current;
     try {
       if (activeData.type === "assign") {
         const a = activeData.assignment;
-        if (a.remaining <= 0) {
-          toast.error("Jam mengajar sudah terpenuhi");
-          return;
-        }
+        if (a.remaining <= 0) { toast.error("Jam mengajar sudah terpenuhi"); return; }
         const teacher = teacherMap[a.teacher_id];
         if (teacher?.availability?.[`${day}-${slot}`] === "unavailable") {
           toast.warning(`${teacher.name} tidak tersedia — konflik akan tercatat`);
         }
-        await placeSlot({
-          class_id: selectedClassId,
-          day,
-          slot,
-          subject_id: a.subject_id,
-          teacher_id: a.teacher_id,
-        });
+        await placeSlot({ class_id: selectedClassId, day, slot, subject_id: a.subject_id, teacher_id: a.teacher_id });
         toast.success(`Ditempatkan pada ${DAY_ID[day]} JP ${slot}`);
       } else if (activeData.type === "slot") {
         const cell = activeData.cell;
         if (cell.day === day && cell.slot === slot) return;
         await api.delete(`/schedule/${cell.id}`);
-        await placeSlot({
-          class_id: cell.class_id,
-          day,
-          slot,
-          subject_id: cell.subject_id,
-          teacher_id: cell.teacher_id,
-        });
+        await placeSlot({ class_id: cell.class_id, day, slot, subject_id: cell.subject_id, teacher_id: cell.teacher_id });
         toast.success(`Dipindahkan ke ${DAY_ID[day]} JP ${slot}`);
       }
       loadAll();
@@ -260,24 +198,16 @@ export default function ScheduleBuilder() {
     }
   };
 
-  const clearSlot = async (id) => {
-    await api.delete(`/schedule/${id}`);
-    loadAll();
-  };
-
+  const clearSlot = async (id) => { await api.delete(`/schedule/${id}`); loadAll(); };
   const autoSchedule = async () => {
     setAutoLoading(true);
     try {
       const r = await api.post("/schedule/auto", {});
       toast.success(`Auto-scheduler menambahkan ${r.data.added} slot`);
       loadAll();
-    } catch (e) {
-      toast.error("Auto-scheduler gagal");
-    } finally {
-      setAutoLoading(false);
-    }
+    } catch (e) { toast.error("Auto-scheduler gagal"); }
+    finally { setAutoLoading(false); }
   };
-
   const clearAll = async () => {
     if (!window.confirm("Bersihkan semua jadwal?")) return;
     await api.post("/schedule/clear", {});
@@ -286,12 +216,9 @@ export default function ScheduleBuilder() {
   };
 
   const totalConflictsForClass = conflicts.filter(
-    (c) =>
-      (c.class_ids && c.class_ids.includes(selectedClassId)) ||
-      c.class_id === selectedClassId
+    (c) => (c.class_ids && c.class_ids.includes(selectedClassId)) || c.class_id === selectedClassId
   ).length;
 
-  // Overlay content while dragging
   const overlaySubject = activeDrag && (activeDrag.type === "assign"
     ? subjectMap[activeDrag.assignment.subject_id]
     : subjectMap[activeDrag.cell.subject_id]);
@@ -321,30 +248,15 @@ export default function ScheduleBuilder() {
                 <SelectValue placeholder="Kelas..." />
               </SelectTrigger>
               <SelectContent className="bg-white">
-                {classes.map((c) => (
-                  <SelectItem key={c.id} value={c.id}>
-                    {c.name}
-                  </SelectItem>
-                ))}
+                {classes.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}</SelectItem>)}
               </SelectContent>
             </Select>
-            <Button
-              data-testid="auto-schedule-btn"
-              onClick={autoSchedule}
-              disabled={autoLoading}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white"
-            >
+            <Button data-testid="auto-schedule-btn" onClick={autoSchedule} disabled={autoLoading} className="bg-emerald-600 hover:bg-emerald-700 text-white">
               <Sparkles size={14} className="mr-2" />
               {autoLoading ? "Menyusun..." : "Auto-Scheduler"}
             </Button>
-            <Button
-              data-testid="clear-schedule-btn"
-              onClick={clearAll}
-              variant="outline"
-              className="border-red-200 text-red-600 hover:bg-red-50"
-            >
-              <Trash2 size={14} className="mr-2" />
-              Bersihkan
+            <Button data-testid="clear-schedule-btn" onClick={clearAll} variant="outline" className="border-red-200 text-red-600 hover:bg-red-50">
+              <Trash2 size={14} className="mr-2" /> Bersihkan
             </Button>
           </div>
         </div>
@@ -357,21 +269,13 @@ export default function ScheduleBuilder() {
         )}
 
         <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr] gap-4">
-          {/* Assignment Pool */}
-          <aside className="bg-white border border-slate-200 rounded-lg p-4 h-fit sticky top-4">
+          <aside className="bg-white border border-slate-200 rounded-lg p-4 h-fit lg:sticky top-4">
             <div className="flex items-center justify-between mb-3">
               <div>
-                <h3 className="font-semibold text-sm text-slate-900 tracking-tight">
-                  Belum Terjadwal
-                </h3>
-                <p className="text-[11px] text-slate-500">
-                  Kelas {classMap[selectedClassId]?.name || "—"}
-                </p>
+                <h3 className="font-semibold text-sm text-slate-900 tracking-tight">Belum Terjadwal</h3>
+                <p className="text-[11px] text-slate-500">Kelas {classMap[selectedClassId]?.name || "—"}</p>
               </div>
-              <span
-                data-testid="pool-remaining"
-                className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium border border-emerald-200"
-              >
+              <span data-testid="pool-remaining" className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium border border-emerald-200">
                 {totalRemaining} JP
               </span>
             </div>
@@ -394,79 +298,85 @@ export default function ScheduleBuilder() {
             )}
           </aside>
 
-          {/* Schedule Matrix */}
           <div className="bg-white border border-slate-200 rounded-lg matrix-scroll">
             <table className="w-full text-sm">
-              <thead className="bg-slate-50 border-b border-slate-200 sticky top-0">
+              <thead className="bg-slate-50 border-b border-slate-200 sticky top-0 z-10">
                 <tr>
-                  <th className="p-2 text-left text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-10 w-24">
-                    JP
-                  </th>
+                  <th className="p-2 text-left text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-10 w-24">JP</th>
                   {DAYS.map((d) => (
-                    <th
-                      key={d}
-                      className="p-2 text-xs uppercase tracking-wide text-slate-500 min-w-[160px]"
-                    >
+                    <th key={d} className="p-2 text-xs uppercase tracking-wide text-slate-500 min-w-[160px]">
                       {DAY_ID[d]}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {SLOTS.map((slot) => (
-                  <>
-                    <tr key={slot} className="border-b border-slate-100">
-                      <td className="p-2 sticky left-0 bg-white border-r border-slate-100 font-semibold text-slate-800">
-                        JP {slot}
-                      </td>
-                      {DAYS.map((day) => {
-                        const isPrayer = isFridayPrayerSlot(day, slot);
-                        if (isPrayer)
+                {rows.map((slot) => {
+                  const breakRow = getBreakRow(configs, slot);
+                  return (
+                    <Fragment key={slot}>
+                      <tr className="border-b border-slate-100">
+                        <td className="p-2 sticky left-0 bg-white border-r border-slate-100 font-semibold text-slate-800">
+                          JP {slot}
+                        </td>
+                        {DAYS.map((day) => {
+                          const valid = isSlotValid(configs, day, slot);
+                          if (!valid) {
+                            return (
+                              <td key={day} className="p-1">
+                                <div className="text-center py-3 text-[11px] text-slate-300">—</div>
+                              </td>
+                            );
+                          }
+                          const cell = slotAt(day, slot);
+                          const conflict = conflictAt(day, slot);
                           return (
                             <td key={day} className="p-1">
-                              <div className="cell-friday-prayer text-center py-3 text-[11px] font-medium rounded">
-                                Sholat Jum'at
-                              </div>
+                              <DroppableCell day={day} slot={slot}>
+                                {cell ? (
+                                  <DraggableFilledCell
+                                    cell={cell}
+                                    subject={subjectMap[cell.subject_id]}
+                                    teacher={teacherMap[cell.teacher_id]}
+                                    conflict={conflict}
+                                    onClear={() => clearSlot(cell.id)}
+                                  />
+                                ) : (
+                                  <div
+                                    data-testid={`empty-cell-${day}-${slot}`}
+                                    className="w-full py-3 border border-dashed border-slate-200 rounded text-slate-400 text-center text-xs"
+                                  >
+                                    Seret ke sini
+                                  </div>
+                                )}
+                              </DroppableCell>
                             </td>
                           );
-                        const cell = slotAt(day, slot);
-                        const conflict = conflictAt(day, slot);
-                        return (
-                          <td key={day} className="p-1">
-                            <DroppableCell day={day} slot={slot} disabled={isPrayer}>
-                              {cell ? (
-                                <DraggableFilledCell
-                                  cell={cell}
-                                  subject={subjectMap[cell.subject_id]}
-                                  teacher={teacherMap[cell.teacher_id]}
-                                  conflict={conflict}
-                                  onClear={() => clearSlot(cell.id)}
-                                />
-                              ) : (
-                                <div
-                                  data-testid={`empty-cell-${day}-${slot}`}
-                                  className="w-full py-3 border border-dashed border-slate-200 rounded text-slate-400 text-center text-xs"
-                                >
-                                  Seret ke sini
-                                </div>
-                              )}
-                            </DroppableCell>
-                          </td>
-                        );
-                      })}
-                    </tr>
-                    {isBreakAfter("Monday", slot) && (
-                      <tr>
-                        <td
-                          colSpan={DAYS.length + 1}
-                          className="cell-break text-center text-xs font-medium py-1.5"
-                        >
-                          {isBreakAfter("Monday", slot)}
-                        </td>
+                        })}
                       </tr>
-                    )}
-                  </>
-                ))}
+                      {breakRow && (
+                        <tr>
+                          <td className="p-1 sticky left-0 bg-slate-50 border-r border-slate-100 text-[10px] text-amber-800 uppercase tracking-wide">
+                            Break
+                          </td>
+                          {DAYS.map((day) => {
+                            const breaks = breakRow[day] || [];
+                            if (!breaks.length) return <td key={day} className="p-1"></td>;
+                            return (
+                              <td key={day} className="p-1">
+                                {breaks.map((b, i) => (
+                                  <div key={i} className="cell-break text-center py-1 text-[10px] font-medium rounded">
+                                    {b.label} · {b.duration_min}m
+                                  </div>
+                                ))}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -479,12 +389,8 @@ export default function ScheduleBuilder() {
             className="p-2.5 border rounded-md text-xs bg-white shadow-lg scale-105"
             style={{ borderLeft: `3px solid ${overlaySubject?.color || "#059669"}` }}
           >
-            <div className="font-semibold text-slate-900">
-              {overlaySubject?.name || "?"}
-            </div>
-            <div className="text-slate-600 text-[11px]">
-              {overlayTeacher?.name?.split(",")[0] || "?"}
-            </div>
+            <div className="font-semibold text-slate-900">{overlaySubject?.name || "?"}</div>
+            <div className="text-slate-600 text-[11px]">{overlayTeacher?.name?.split(",")[0] || "?"}</div>
           </div>
         ) : null}
       </DragOverlay>

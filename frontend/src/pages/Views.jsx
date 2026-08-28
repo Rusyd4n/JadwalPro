@@ -1,6 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import api from "@/lib/api";
-import { DAYS, DAY_ID, SLOTS, isFridayPrayerSlot, getSlotTime, isBreakAfter } from "@/lib/constants";
+import { DAYS, DAY_ID } from "@/lib/constants";
+import {
+  useConfig, maxPeriodCount, isSlotValid, getSlotTiming, getBreakRow,
+} from "@/lib/scheduleConfig";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -9,6 +12,7 @@ import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 
 export default function Views() {
+  const { configs } = useConfig();
   const [teachers, setTeachers] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [classes, setClasses] = useState([]);
@@ -31,10 +35,10 @@ export default function Views() {
   const teacherMap = useMemo(() => Object.fromEntries(teachers.map((t) => [t.id, t])), [teachers]);
   const subjectMap = useMemo(() => Object.fromEntries(subjects.map((s) => [s.id, s])), [subjects]);
   const classMap = useMemo(() => Object.fromEntries(classes.map((c) => [c.id, c])), [classes]);
+  const maxSlots = useMemo(() => maxPeriodCount(configs), [configs]);
+  const rows = useMemo(() => Array.from({ length: maxSlots }, (_, i) => i + 1), [maxSlots]);
 
-  const cellFor = (filterFn, day, slot) => {
-    return schedule.find((s) => s.day === day && s.slot === slot && filterFn(s));
-  };
+  const cellFor = (filterFn, day, slot) => schedule.find((s) => s.day === day && s.slot === slot && filterFn(s));
 
   const renderMatrix = (filterFn, showTeacher = true) => (
     <div className="bg-white border border-slate-200 rounded-lg matrix-scroll">
@@ -42,39 +46,74 @@ export default function Views() {
         <thead className="bg-slate-50 border-b border-slate-200">
           <tr>
             <th className="p-2 text-left text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-10 w-28">Jam</th>
-            {DAYS.map((d) => <th key={d} className="p-2 text-xs uppercase tracking-wide text-slate-500 min-w-[140px]">{DAY_ID[d]}</th>)}
+            {DAYS.map((d) => (
+              <th key={d} className="p-2 text-xs uppercase tracking-wide text-slate-500 min-w-[140px]">{DAY_ID[d]}</th>
+            ))}
           </tr>
         </thead>
         <tbody>
-          {SLOTS.map((slot) => (
-            <>
-              <tr key={slot} className="border-b border-slate-100">
-                <td className="p-2 sticky left-0 bg-white border-r border-slate-100">
-                  <div className="font-semibold text-slate-800 text-xs">JP {slot}</div>
-                  <div className="font-mono text-[10px] text-slate-500">{getSlotTime("Monday", slot)}</div>
-                </td>
-                {DAYS.map((day) => {
-                  if (isFridayPrayerSlot(day, slot)) return <td key={day} className="p-1"><div className="cell-friday-prayer text-center py-2 text-[11px] font-medium rounded">Sholat Jum'at</div></td>;
-                  const s = cellFor(filterFn, day, slot);
-                  if (!s) return <td key={day} className="p-1"><div className="text-slate-300 text-center py-3 text-xs">—</div></td>;
-                  const subject = subjectMap[s.subject_id];
-                  return (
-                    <td key={day} className="p-1">
-                      <div className="rounded p-2 text-xs" style={{ background: (subject?.color || "#059669") + "20", borderLeft: `3px solid ${subject?.color || "#059669"}` }}>
-                        <div className="font-semibold text-slate-900 truncate">{subject?.name || "?"}</div>
-                        <div className="text-slate-600 text-[11px] truncate">
-                          {showTeacher ? (teacherMap[s.teacher_id]?.name?.split(",")[0] || "?") : classMap[s.class_id]?.name}
+          {rows.map((slot) => {
+            const breakRow = getBreakRow(configs, slot);
+            return (
+              <Fragment key={slot}>
+                <tr className="border-b border-slate-100">
+                  <td className="p-2 sticky left-0 bg-white border-r border-slate-100">
+                    <div className="font-semibold text-slate-800 text-xs">JP {slot}</div>
+                  </td>
+                  {DAYS.map((day) => {
+                    if (!isSlotValid(configs, day, slot)) {
+                      return (
+                        <td key={day} className="p-1">
+                          <div className="text-slate-300 text-center py-3 text-xs">—</div>
+                        </td>
+                      );
+                    }
+                    const s = cellFor(filterFn, day, slot);
+                    const timing = getSlotTiming(configs, day, slot);
+                    if (!s) {
+                      return (
+                        <td key={day} className="p-1">
+                          <div className="text-slate-300 text-center py-3 text-xs font-mono">
+                            {timing?.start_str || "—"}
+                          </div>
+                        </td>
+                      );
+                    }
+                    const subject = subjectMap[s.subject_id];
+                    return (
+                      <td key={day} className="p-1">
+                        <div className="rounded p-2 text-xs" style={{ background: (subject?.color || "#059669") + "20", borderLeft: `3px solid ${subject?.color || "#059669"}` }}>
+                          <div className="font-mono text-[10px] text-slate-500">{timing?.start_str}</div>
+                          <div className="font-semibold text-slate-900 truncate">{subject?.name || "?"}</div>
+                          <div className="text-slate-600 text-[11px] truncate">
+                            {showTeacher ? (teacherMap[s.teacher_id]?.name?.split(",")[0] || "?") : classMap[s.class_id]?.name}
+                          </div>
                         </div>
-                      </div>
-                    </td>
-                  );
-                })}
-              </tr>
-              {isBreakAfter("Monday", slot) && (
-                <tr><td colSpan={DAYS.length + 1} className="cell-break text-center text-xs font-medium py-1.5">{isBreakAfter("Monday", slot)}</td></tr>
-              )}
-            </>
-          ))}
+                      </td>
+                    );
+                  })}
+                </tr>
+                {breakRow && (
+                  <tr>
+                    <td className="p-1 sticky left-0 bg-slate-50 border-r border-slate-100 text-[10px] text-amber-800 uppercase tracking-wide">Break</td>
+                    {DAYS.map((day) => {
+                      const breaks = breakRow[day] || [];
+                      if (!breaks.length) return <td key={day} className="p-1"></td>;
+                      return (
+                        <td key={day} className="p-1">
+                          {breaks.map((b, i) => (
+                            <div key={i} className="cell-break text-center py-1 text-[10px] font-medium rounded">
+                              {b.label} · {b.duration_min}m
+                            </div>
+                          ))}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                )}
+              </Fragment>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -96,24 +135,29 @@ export default function Views() {
     }
     const doc = new jsPDF({ orientation: "landscape", unit: "pt", format: "a4" });
     doc.setFontSize(16);
-    doc.text("EduSchedule AI — MA Persis Katapang", 40, 40);
+    doc.text("JadwalPro — MA Persis Katapang", 40, 40);
     doc.setFontSize(12);
     doc.text(title, 40, 60);
 
     const head = [["JP / Jam", ...DAYS.map((d) => DAY_ID[d])]];
-    const body = SLOTS.map((slot) => {
-      const row = [`JP ${slot}\n${getSlotTime("Monday", slot)}`];
+    const body = rows.map((slot) => {
+      const row = [`JP ${slot}`];
       DAYS.forEach((day) => {
-        if (isFridayPrayerSlot(day, slot)) { row.push("Sholat Jum'at"); return; }
+        if (!isSlotValid(configs, day, slot)) { row.push("—"); return; }
         const s = schedule.find((x) => x.day === day && x.slot === slot && filterFn(x));
-        if (!s) { row.push("—"); return; }
+        const timing = getSlotTiming(configs, day, slot);
+        if (!s) { row.push(timing?.start_str || "—"); return; }
         const subject = subjectMap[s.subject_id];
         const extra = showTeacher ? teacherMap[s.teacher_id]?.name?.split(",")[0] : classMap[s.class_id]?.name;
-        row.push(`${subject?.name || "?"}\n${extra || ""}`);
+        row.push(`${timing?.start_str || ""}\n${subject?.name || "?"}\n${extra || ""}`);
       });
       return row;
     });
-    autoTable(doc, { head, body, startY: 80, styles: { fontSize: 8, cellPadding: 4 }, headStyles: { fillColor: [5, 150, 105] } });
+    autoTable(doc, {
+      head, body, startY: 80,
+      styles: { fontSize: 8, cellPadding: 4 },
+      headStyles: { fillColor: [5, 150, 105] },
+    });
     doc.save(`${title}.pdf`);
   };
 
