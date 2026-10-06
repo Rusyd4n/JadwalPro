@@ -1,8 +1,10 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie, UploadFile, File
+from fastapi.responses import JSONResponse, StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+import csv
+import io
 import os
 import logging
 import uuid
@@ -70,6 +72,10 @@ class Assignment(BaseModel):
     subject_id: str
     class_id: str
     hours_per_week: int
+
+
+class BulkDelete(BaseModel):
+    ids: List[str]
 
 
 class ScheduleSlot(BaseModel):
@@ -286,6 +292,177 @@ async def delete_teacher(teacher_id: str, request: Request):
     return {"ok": True}
 
 
+@api_router.post("/teachers/bulk-delete")
+async def bulk_delete_teachers(payload: BulkDelete, request: Request):
+    """Hapus banyak guru sekaligus + cascade assignments & schedule."""
+    await require_user(request)
+    ids = payload.ids or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="Tidak ada ID yang dipilih")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="Maksimal 500 item per bulk delete")
+    t = await db.teachers.delete_many({"id": {"$in": ids}})
+    a = await db.assignments.delete_many({"teacher_id": {"$in": ids}})
+    s = await db.schedule.delete_many({"teacher_id": {"$in": ids}})
+    return {"ok": True, "deleted_teachers": t.deleted_count,
+            "deleted_assignments": a.deleted_count, "deleted_schedule": s.deleted_count}
+
+
+TEACHER_TEMPLATE_HEADERS = ["nama", "email", "whatsapp", "max_jp_per_minggu", "catatan"]
+
+
+def _default_teacher_availability() -> Dict[str, str]:
+    av: Dict[str, str] = {}
+    for day in DAYS:
+        slots = FRIDAY_SLOTS if day == "Friday" else REGULAR_SLOTS
+        for s in slots:
+            av[f"{day}-{s}"] = "available"
+    return av
+
+
+def _decode_csv_bytes(raw: bytes) -> str:
+    """Decode CSV bytes toleran: coba UTF-8 (BOM), lalu Windows-1252/Latin-1.
+
+    File dari Excel Indonesia sering tersimpan sebagai ANSI (cp1252)
+    atau CSV dengan delimiter ';' — bukan UTF-8 murni.
+    latin-1 selalu berhasil decode, jadi error UTF-8 tidak lagi muncul;
+    validasi isi tetap via header/delimiter.
+    """
+    if not raw:
+        raise HTTPException(status_code=400, detail="File CSV kosong")
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, ValueError):
+            continue
+    raise HTTPException(
+        status_code=400,
+        detail="File tidak terbaca. Simpan ulang sebagai CSV (UTF-8 atau ANSI) lalu coba lagi.",
+    )
+
+
+def _make_csv_reader(text: str) -> csv.DictReader:
+    """Buat DictReader dengan auto-deteksi delimiter ',' vs ';' vs tab.
+
+    Excel Indonesia memakai ';' karena koma dipakai desimal.
+    """
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="File CSV kosong / tanpa header")
+    # Bersihkan BOM di awal file bila masih tersisa
+    text = text.lstrip("\ufeff")
+    lines = [ln for ln in text.splitlines() if ln.strip()][:5]
+    sample = "\n".join(lines)
+    delimiter = ","
+    if sample:
+        counts = {d: sample.count(d) for d in (",", ";", "\t")}
+        best = max(counts, key=lambda k: counts[k])
+        if counts[best] > 0:
+            delimiter = best
+    try:
+        reader = csv.DictReader(io.StringIO(text), delimiter=delimiter, skipinitialspace=True)
+    except Exception:
+        raise HTTPException(status_code=400, detail="File CSV tidak valid / rusak")
+    if not reader.fieldnames or not any((f or "").strip(" \t\r\n\ufeff") for f in reader.fieldnames):
+        raise HTTPException(status_code=400, detail="File CSV kosong / tanpa header")
+    # Bersihkan BOM/spasi pada nama header agar mapping alias tetap cocok
+    reader.fieldnames = [(f or "").strip().lstrip("\ufeff") for f in reader.fieldnames]
+    return reader
+
+
+@api_router.get("/teachers/template")
+async def download_teacher_template(request: Request):
+    """Unduh template CSV untuk bulk input guru."""
+    await require_user(request)
+    docs = await db.teachers.find({}, {"_id": 0}).to_list(500)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(TEACHER_TEMPLATE_HEADERS)
+    if docs:
+        for d in docs[:2]:
+            writer.writerow([d.get("name", ""), d.get("email", ""), d.get("whatsapp", ""),
+                             d.get("max_hours_per_week", 24), d.get("notes", "")])
+    else:
+        writer.writerow(["Drs. Dadang Ahmad Tajudin", "", "081200000001", 24, "Contoh catatan"])
+        writer.writerow(["Zaenal Mutaqin, S.Ag", "", "081200000002", 24, ""])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=template_teachers.csv"},
+    )
+
+
+@api_router.post("/teachers/upload")
+async def upload_teachers(request: Request, file: UploadFile = File(...)):
+    """Unggah CSV guru. Duplikat nama (case-insensitive) akan di-update."""
+    await require_user(request)
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File harus berformat .csv")
+    raw = await file.read()
+    text = _decode_csv_bytes(raw)
+    reader = _make_csv_reader(text)
+
+    def canon(h: str) -> str:
+        h = (h or "").strip().lower()
+        if h in ("nama", "name", "nama_lengkap", "nama lengkap", "guru"):
+            return "nama"
+        if h in ("email", "e-mail"):
+            return "email"
+        if h in ("whatsapp", "wa", "no_wa", "telepon", "phone"):
+            return "whatsapp"
+        if h in ("max_jp_per_minggu", "max_jp", "maks_jp", "max_hours_per_week",
+                 "max_hours", "jp_maks", "maks jp", "jp per minggu"):
+            return "max_jp_per_minggu"
+        if h in ("catatan", "notes", "note", "keterangan"):
+            return "catatan"
+        return h
+
+    mapped = {f: canon(f) for f in reader.fieldnames}
+    if "nama" not in mapped.values():
+        raise HTTPException(status_code=400,
+                            detail=f"Header kurang: nama. Header wajib: {', '.join(TEACHER_TEMPLATE_HEADERS)}")
+
+    docs = await db.teachers.find({}, {"_id": 0}).to_list(1000)
+    by_name = {d["name"].strip().lower(): d for d in docs}
+    added, updated = 0, 0
+    errors: List[dict] = []
+    for i, row in enumerate(reader, start=2):
+        norm = {mapped[k]: (v or "").strip() for k, v in row.items() if k is not None}
+        if not any(norm.values()):
+            continue
+        name = norm.get("nama", "")
+        if not name:
+            errors.append({"row": i, "message": "Nama wajib diisi"})
+            continue
+        jp_raw = norm.get("max_jp_per_minggu", "") or "24"
+        try:
+            jp = int(float(str(jp_raw).replace(",", ".")))
+        except (ValueError, TypeError):
+            errors.append({"row": i, "message": f"Maks JP tidak valid: '{jp_raw}'"})
+            continue
+        if jp < 1 or jp > 60:
+            errors.append({"row": i, "message": f"Maks JP di luar rentang 1-60: '{jp_raw}'"})
+            continue
+        key = name.lower()
+        if key in by_name:
+            await db.teachers.update_one(
+                {"id": by_name[key]["id"]},
+                {"$set": {"name": name, "email": norm.get("email", ""),
+                          "whatsapp": norm.get("whatsapp", ""),
+                          "max_hours_per_week": jp, "notes": norm.get("catatan", "")}},
+            )
+            updated += 1
+        else:
+            doc = {"id": new_id("t"), "name": name, "email": norm.get("email", ""),
+                   "whatsapp": norm.get("whatsapp", ""), "max_hours_per_week": jp,
+                   "notes": norm.get("catatan", ""),
+                   "availability": _default_teacher_availability()}
+            await db.teachers.insert_one(doc)
+            by_name[key] = doc
+            added += 1
+    return {"ok": True, "added": added, "updated": updated, "errors": errors, "skipped": len(errors)}
+
+
 # ---------------- Subjects ----------------
 @api_router.get("/subjects", response_model=List[Subject])
 async def list_subjects(request: Request):
@@ -310,6 +487,103 @@ async def delete_subject(subject_id: str, request: Request):
     return {"ok": True}
 
 
+@api_router.post("/subjects/bulk-delete")
+async def bulk_delete_subjects(payload: BulkDelete, request: Request):
+    """Hapus banyak mapel sekaligus + cascade assignments & schedule."""
+    await require_user(request)
+    ids = payload.ids or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="Tidak ada ID yang dipilih")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="Maksimal 500 item per bulk delete")
+    t = await db.subjects.delete_many({"id": {"$in": ids}})
+    a = await db.assignments.delete_many({"subject_id": {"$in": ids}})
+    s = await db.schedule.delete_many({"subject_id": {"$in": ids}})
+    return {"ok": True, "deleted_subjects": t.deleted_count,
+            "deleted_assignments": a.deleted_count, "deleted_schedule": s.deleted_count}
+
+
+SUBJECT_TEMPLATE_HEADERS = ["nama", "kode", "warna"]
+
+
+@api_router.get("/subjects/template")
+async def download_subject_template(request: Request):
+    """Unduh template CSV untuk bulk input mata pelajaran."""
+    await require_user(request)
+    docs = await db.subjects.find({}, {"_id": 0}).to_list(500)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(SUBJECT_TEMPLATE_HEADERS)
+    if docs:
+        for d in docs[:3]:
+            writer.writerow([d.get("name", ""), d.get("code", ""), d.get("color", "#059669")])
+    else:
+        writer.writerow(["Matematika", "MTK", "#059669"])
+        writer.writerow(["Fiqih", "FQH", "#8B5CF6"])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=template_subjects.csv"},
+    )
+
+
+@api_router.post("/subjects/upload")
+async def upload_subjects(request: Request, file: UploadFile = File(...)):
+    """Unggah CSV mata pelajaran. Duplikat nama akan di-update."""
+    await require_user(request)
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File harus berformat .csv")
+    raw = await file.read()
+    text = _decode_csv_bytes(raw)
+    reader = _make_csv_reader(text)
+
+    def canon(h: str) -> str:
+        h = (h or "").strip().lower()
+        if h in ("nama", "name", "mapel", "mata_pelajaran", "mata pelajaran"):
+            return "nama"
+        if h in ("kode", "code", "singkatan"):
+            return "kode"
+        if h in ("warna", "color", "colour"):
+            return "warna"
+        return h
+
+    mapped = {f: canon(f) for f in reader.fieldnames}
+    if "nama" not in mapped.values():
+        raise HTTPException(status_code=400,
+                            detail=f"Header kurang: nama. Header wajib: {', '.join(SUBJECT_TEMPLATE_HEADERS)}")
+
+    docs = await db.subjects.find({}, {"_id": 0}).to_list(1000)
+    by_name = {d["name"].strip().lower(): d for d in docs}
+    added, updated = 0, 0
+    errors: List[dict] = []
+    for i, row in enumerate(reader, start=2):
+        norm = {mapped[k]: (v or "").strip() for k, v in row.items() if k is not None}
+        if not any(norm.values()):
+            continue
+        name = norm.get("nama", "")
+        if not name:
+            errors.append({"row": i, "message": "Nama wajib diisi"})
+            continue
+        color = norm.get("warna", "") or "#059669"
+        if not color.startswith("#") or len(color) not in (4, 7):
+            errors.append({"row": i, "message": f"Warna tidak valid: '{color}' (contoh #059669)"})
+            continue
+        key = name.lower()
+        if key in by_name:
+            await db.subjects.update_one(
+                {"id": by_name[key]["id"]},
+                {"$set": {"name": name, "code": norm.get("kode", ""), "color": color}},
+            )
+            updated += 1
+        else:
+            doc = {"id": new_id("s"), "name": name, "code": norm.get("kode", ""), "color": color}
+            await db.subjects.insert_one(doc)
+            by_name[key] = doc
+            added += 1
+    return {"ok": True, "added": added, "updated": updated, "errors": errors, "skipped": len(errors)}
+
+
 # ---------------- Classes ----------------
 @api_router.get("/classes", response_model=List[SchoolClass])
 async def list_classes(request: Request):
@@ -332,6 +606,110 @@ async def delete_class(class_id: str, request: Request):
     await db.assignments.delete_many({"class_id": class_id})
     await db.schedule.delete_many({"class_id": class_id})
     return {"ok": True}
+
+
+@api_router.post("/classes/bulk-delete")
+async def bulk_delete_classes(payload: BulkDelete, request: Request):
+    """Hapus banyak kelas sekaligus + cascade assignments & schedule."""
+    await require_user(request)
+    ids = payload.ids or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="Tidak ada ID yang dipilih")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="Maksimal 500 item per bulk delete")
+    t = await db.classes.delete_many({"id": {"$in": ids}})
+    a = await db.assignments.delete_many({"class_id": {"$in": ids}})
+    s = await db.schedule.delete_many({"class_id": {"$in": ids}})
+    return {"ok": True, "deleted_classes": t.deleted_count,
+            "deleted_assignments": a.deleted_count, "deleted_schedule": s.deleted_count}
+
+
+CLASS_TEMPLATE_HEADERS = ["nama", "tingkat"]
+
+
+def _normalize_grade(v: str) -> Optional[str]:
+    v = (v or "").strip().upper()
+    if v in ("X", "10"):
+        return "X"
+    if v in ("XI", "11"):
+        return "XI"
+    if v in ("XII", "12"):
+        return "XII"
+    return None
+
+
+@api_router.get("/classes/template")
+async def download_class_template(request: Request):
+    """Unduh template CSV untuk bulk input kelas."""
+    await require_user(request)
+    docs = await db.classes.find({}, {"_id": 0}).to_list(500)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(CLASS_TEMPLATE_HEADERS)
+    if docs:
+        for d in docs[:4]:
+            writer.writerow([d.get("name", ""), d.get("grade", "")])
+    else:
+        writer.writerow(["X-1", "X"])
+        writer.writerow(["XI-1", "XI"])
+        writer.writerow(["XII-1", "XII"])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=template_classes.csv"},
+    )
+
+
+@api_router.post("/classes/upload")
+async def upload_classes(request: Request, file: UploadFile = File(...)):
+    """Unggah CSV kelas. Duplikat nama akan di-update tingkatnya."""
+    await require_user(request)
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File harus berformat .csv")
+    raw = await file.read()
+    text = _decode_csv_bytes(raw)
+    reader = _make_csv_reader(text)
+
+    def canon(h: str) -> str:
+        h = (h or "").strip().lower()
+        if h in ("nama", "name", "kelas", "class", "nama_kelas"):
+            return "nama"
+        if h in ("tingkat", "grade", "kelas_tingkat", "jenjang"):
+            return "tingkat"
+        return h
+
+    mapped = {f: canon(f) for f in reader.fieldnames}
+    if "nama" not in mapped.values():
+        raise HTTPException(status_code=400,
+                            detail=f"Header kurang: nama. Header wajib: {', '.join(CLASS_TEMPLATE_HEADERS)}")
+
+    docs = await db.classes.find({}, {"_id": 0}).to_list(1000)
+    by_name = {d["name"].strip().lower(): d for d in docs}
+    added, updated = 0, 0
+    errors: List[dict] = []
+    for i, row in enumerate(reader, start=2):
+        norm = {mapped[k]: (v or "").strip() for k, v in row.items() if k is not None}
+        if not any(norm.values()):
+            continue
+        name = norm.get("nama", "")
+        if not name:
+            errors.append({"row": i, "message": "Nama wajib diisi"})
+            continue
+        grade = _normalize_grade(norm.get("tingkat", ""))
+        if not grade:
+            errors.append({"row": i, "message": f"Tingkat tidak valid: '{norm.get('tingkat', '')}' (isi X/XI/XII)"})
+            continue
+        key = name.lower()
+        if key in by_name:
+            await db.classes.update_one({"id": by_name[key]["id"]}, {"$set": {"name": name, "grade": grade}})
+            updated += 1
+        else:
+            doc = {"id": new_id("c"), "name": name, "grade": grade}
+            await db.classes.insert_one(doc)
+            by_name[key] = doc
+            added += 1
+    return {"ok": True, "added": added, "updated": updated, "errors": errors, "skipped": len(errors)}
 
 
 # ---------------- Assignments ----------------
@@ -363,6 +741,740 @@ async def delete_assignment(assignment_id: str, request: Request):
     await require_user(request)
     await db.assignments.delete_one({"id": assignment_id})
     return {"ok": True}
+
+
+@api_router.post("/assignments/bulk-delete")
+async def bulk_delete_assignments(payload: BulkDelete, request: Request):
+    """Hapus banyak penugasan sekaligus."""
+    await require_user(request)
+    ids = payload.ids or []
+    if not ids:
+        raise HTTPException(status_code=400, detail="Tidak ada ID yang dipilih")
+    if len(ids) > 1000:
+        raise HTTPException(status_code=400, detail="Maksimal 1000 item per bulk delete")
+    r = await db.assignments.delete_many({"id": {"$in": ids}})
+    return {"ok": True, "deleted": r.deleted_count}
+
+
+ASSIGNMENT_TEMPLATE_HEADERS = ["nama_guru", "mata_pelajaran", "kelas", "jp_per_minggu"]
+
+
+@api_router.get("/assignments/template")
+async def download_assignment_template(request: Request):
+    """Unduh template CSV untuk bulk input assignments.
+
+    Kolom: nama_guru, mata_pelajaran, kelas, jp_per_minggu.
+    Nama harus sama persis (case-insensitive) dengan data master.
+    """
+    await require_user(request)
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
+    subjects = await db.subjects.find({}, {"_id": 0}).to_list(500)
+    classes = await db.classes.find({}, {"_id": 0}).to_list(500)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(ASSIGNMENT_TEMPLATE_HEADERS)
+    # Baris contoh: pakai data master pertama bila ada, agar user tinggal timpa
+    if teachers and subjects and classes:
+        writer.writerow([teachers[0]["name"], subjects[0]["name"], classes[0]["name"], 2])
+        if len(teachers) > 1 and len(subjects) > 1 and len(classes) > 1:
+            writer.writerow([teachers[1]["name"], subjects[1]["name"], classes[1]["name"], 4])
+    else:
+        writer.writerow(["Drs. Dadang Ahmad Tajudin", "Matematika", "X-1", 2])
+        writer.writerow(["Zaenal Mutaqin, S.Ag", "Fiqih", "XI-1", 4])
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=template_assignments.csv"},
+    )
+
+
+@api_router.post("/assignments/upload")
+async def upload_assignments(request: Request, file: UploadFile = File(...)):
+    """Unggah file CSV template assignments.
+
+    Menerima kolom: nama_guru, mata_pelajaran, kelas, jp_per_minggu
+    (alias didukung: guru, mapel/subject, class, jp/hours).
+    Baris duplikat (guru+mapel+kelas sama) akan di-update JP-nya.
+    """
+    await require_user(request)
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File harus berformat .csv")
+
+    raw = await file.read()
+    text = _decode_csv_bytes(raw)
+    reader = _make_csv_reader(text)
+
+    # Normalisasi header -> key kanonis
+    def canon(h: str) -> str:
+        h = (h or "").strip().lower()
+        if h in ("nama_guru", "guru", "teacher", "nama guru"):
+            return "nama_guru"
+        if h in ("mata_pelajaran", "mapel", "subject", "mata pelajaran", "pelajaran"):
+            return "mata_pelajaran"
+        if h in ("kelas", "class", "nama_kelas", "nama kelas"):
+            return "kelas"
+        if h in ("jp_per_minggu", "jp", "jp/minggu", "hours", "hours_per_week", "jp per minggu"):
+            return "jp_per_minggu"
+        return h
+
+    mapped_fields = {f: canon(f) for f in reader.fieldnames}
+    missing = [c for c in ASSIGNMENT_TEMPLATE_HEADERS if c not in mapped_fields.values()]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Header kurang: {', '.join(missing)}. Header wajib: {', '.join(ASSIGNMENT_TEMPLATE_HEADERS)}",
+        )
+
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
+    subjects = await db.subjects.find({}, {"_id": 0}).to_list(500)
+    classes = await db.classes.find({}, {"_id": 0}).to_list(500)
+    teacher_map = {t["name"].strip().lower(): t for t in teachers}
+    subject_map = {s["name"].strip().lower(): s for s in subjects}
+    # kelas juga dikenali via code bila ada
+    class_map = {}
+    for c in classes:
+        class_map[c["name"].strip().lower()] = c
+        if c.get("code"):
+            class_map[str(c["code"]).strip().lower()] = c
+
+    existing = await db.assignments.find({}, {"_id": 0}).to_list(2000)
+    existing_key = {(a["teacher_id"], a["subject_id"], a["class_id"]): a for a in existing}
+
+    added = 0
+    updated = 0
+    errors: List[dict] = []
+
+    for i, row in enumerate(reader, start=2):  # baris 1 = header
+        norm = {mapped_fields[k]: (v or "").strip() for k, v in row.items() if k is not None}
+        if not any(norm.values()):
+            continue  # lewati baris kosong
+        t_name = norm.get("nama_guru", "")
+        s_name = norm.get("mata_pelajaran", "")
+        c_name = norm.get("kelas", "")
+        jp_raw = norm.get("jp_per_minggu", "")
+
+        teacher = teacher_map.get(t_name.lower())
+        if not teacher:
+            errors.append({"row": i, "message": f"Guru tidak ditemukan: '{t_name}'"})
+            continue
+        subject = subject_map.get(s_name.lower())
+        if not subject:
+            errors.append({"row": i, "message": f"Mata pelajaran tidak ditemukan: '{s_name}'"})
+            continue
+        school_class = class_map.get(c_name.lower())
+        if not school_class:
+            errors.append({"row": i, "message": f"Kelas tidak ditemukan: '{c_name}'"})
+            continue
+        try:
+            jp = int(float(str(jp_raw).replace(",", ".")))
+        except (ValueError, TypeError):
+            errors.append({"row": i, "message": f"JP tidak valid: '{jp_raw}' (harus angka 1-40)"})
+            continue
+        if jp < 1 or jp > 40:
+            errors.append({"row": i, "message": f"JP di luar rentang 1-40: '{jp_raw}'"})
+            continue
+
+        key = (teacher["id"], subject["id"], school_class["id"])
+        if key in existing_key:
+            await db.assignments.update_one(
+                {"id": existing_key[key]["id"]},
+                {"$set": {"hours_per_week": jp}},
+            )
+            updated += 1
+        else:
+            doc = {
+                "id": new_id("a"),
+                "teacher_id": teacher["id"],
+                "subject_id": subject["id"],
+                "class_id": school_class["id"],
+                "hours_per_week": jp,
+            }
+            await db.assignments.insert_one(doc)
+            existing_key[key] = doc
+            added += 1
+
+    return {"ok": True, "added": added, "updated": updated, "errors": errors, "skipped": len(errors)}
+
+
+# ---------------- Unified Workbook Import (1 file untuk semua) ----------------
+# Format didukung: .xlsx multi-sheet (Guru, Mapel, Kelas, Penugasan_Matrix)
+# Sheet Penugasan_Matrix memakai format pivot user: kolom B=NAMA GURU,
+# kolom C=MATA PELAJARAN, kolom D..=nama kelas (isi sel = JP), kolom terakhir JUMLAH.
+SUBJECT_COLOR_PALETTE = ["#059669", "#0EA5E9", "#F59E0B", "#8B5CF6", "#10B981",
+                         "#EF4444", "#EC4899", "#F97316", "#3B82F6", "#84CC16"]
+
+
+def _norm_sheet_name(name: str) -> str:
+    return (name or "").strip().lower().replace(" ", "").replace("_", "")
+
+
+def _infer_grade(name: str) -> str:
+    v = (name or "").strip().upper()
+    if v.startswith("XII"):
+        return "XII"
+    if v.startswith("XI"):
+        return "XI"
+    if v.startswith("X"):
+        return "X"
+    return "X"
+
+
+def _norm_header(h: Any) -> str:
+    return str(h or "").strip().lstrip("\ufeff").lower()
+
+
+def _find_matrix_layout(headers: List[str]):
+    """Kembalikan (guru_idx, mapel_idx, class_cols[(idx, class_name)]) atau None.
+
+    class_cols = semua kolom selain NO/guru/mapel/JUMLAH yang headernya tidak kosong.
+    """
+    normed = [_norm_header(h) for h in headers]
+    guru_idx = mapel_idx = None
+    for i, h in enumerate(normed):
+        if h in ("namaguru", "nama guru", "guru", "teacher", "nama"):
+            if guru_idx is None:
+                guru_idx = i
+        if h in ("matapelajaran", "mata pelajaran", "mapel", "subject", "pelajaran"):
+            if mapel_idx is None:
+                mapel_idx = i
+    if guru_idx is None or mapel_idx is None:
+        return None
+    skip = {"no", "nomor", "#", "jumlah", "total", "jml", "keterangan", "catatan"}
+    class_cols = []
+    for i, h in enumerate(headers):
+        if i in (guru_idx, mapel_idx):
+            continue
+        nh = _norm_header(h)
+        if not nh or nh in skip:
+            continue
+        class_cols.append((i, str(h).strip()))
+    if not class_cols:
+        return None
+    return guru_idx, mapel_idx, class_cols
+
+
+@api_router.get("/import/template.xlsx")
+async def download_unified_template(request: Request):
+    """Unduh 1 file .xlsx terpadu: Guru + Mapel + Kelas + Penugasan_Matrix.
+
+    Sheet Penugasan_Matrix sudah terisi dari data DB (pivot) + 20 baris kosong
+    berformula JUMLAH otomatis, validasi JP 0-40, dan dropdown tingkat.
+    """
+    await require_user(request)
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.worksheet.datavalidation import DataValidation
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl belum terinstal di server")
+
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(1000)
+    subjects = await db.subjects.find({}, {"_id": 0}).to_list(1000)
+    classes = await db.classes.find({}, {"_id": 0}).to_list(500)
+    assignments = await db.assignments.find({}, {"_id": 0}).to_list(5000)
+    order = {"X": 0, "XI": 1, "XII": 2}
+    classes = sorted(classes, key=lambda c: (order.get(c.get("grade", "X"), 9), c.get("name", "")))
+
+    t_by_id = {t["id"]: t for t in teachers}
+    s_by_id = {s["id"]: s for s in subjects}
+    c_by_id = {c["id"]: c for c in classes}
+
+    wb = openpyxl.Workbook()
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    hdr_fill = PatternFill("solid", fgColor="059669")
+    thin = Side(style="thin", color="CBD5E1")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center")
+
+    def style_header(ws, ncols):
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = hdr_font
+            cell.fill = hdr_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(ncols)}{ws.max_row}"
+
+    # --- Petunjuk ---
+    ws0 = wb.active
+    ws0.title = "Petunjuk"
+    guide = [
+        ["IMPORT TERPADU JADWALPRO — 1 FILE UNTUK SEMUA DATA"],
+        [""],
+        ["1. Isi sheet Guru, Mapel, Kelas dahulu (atau biarkan — sheet Penugasan_Matrix"],
+        ["   bisa membuat data master baru otomatis saat upload)."],
+        ["2. Isi sheet Penugasan_Matrix: tiap baris = 1 guru + 1 mapel, tiap kolom"],
+        ["   kelas = JP per minggu (kosongkan / isi 0 bila tidak mengajar)."],
+        ["3. Kolom JUMLAH terisi otomatis (formula). Jangan hapus header baris 1."],
+        ["4. Nama guru & mapel bebas (dibuat otomatis bila belum ada). Nama kelas"],
+        ["   baru otomatis dibuat dengan tingkat ditebak dari awalan (X/XI/XII)."],
+        ["5. Upload SEKALI di halaman Teaching Load → Unggah Terpadu (.xlsx)."],
+        [""],
+        ["Aturan: JP 0-40 (bilangan bulat). Tingkat hanya X / XI / XII."],
+        ["Duplikat (guru+mapel+kelas sama) akan di-update, bukan dobel."],
+    ]
+    for r in guide:
+        ws0.append(r)
+    ws0["A1"].font = Font(bold=True, size=13, color="059669")
+    ws0.column_dimensions["A"].width = 78
+
+    # --- Guru ---
+    ws1 = wb.create_sheet("Guru")
+    ws1.append(["nama", "email", "whatsapp", "max_jp_per_minggu", "catatan"])
+    for t in teachers:
+        ws1.append([t.get("name", ""), t.get("email", ""), t.get("whatsapp", ""),
+                    t.get("max_hours_per_week", 24), t.get("notes", "")])
+    if not teachers:
+        ws1.append(["Drs. Dadang Ahmad Tajudin", "", "081200000001", 24, "Contoh"])
+    style_header(ws1, 5)
+    for w, col in zip([32, 24, 18, 20, 30], "ABCDE"):
+        ws1.column_dimensions[col].width = w
+
+    # --- Mapel ---
+    ws2 = wb.create_sheet("Mapel")
+    ws2.append(["nama", "kode", "warna"])
+    for s in subjects:
+        ws2.append([s.get("name", ""), s.get("code", ""), s.get("color", "#059669")])
+    if not subjects:
+        ws2.append(["Matematika", "MTK", "#059669"])
+        ws2.append(["Fiqih", "FQH", "#8B5CF6"])
+    style_header(ws2, 3)
+    for w, col in zip([30, 12, 12], "ABC"):
+        ws2.column_dimensions[col].width = w
+
+    # --- Kelas ---
+    ws3 = wb.create_sheet("Kelas")
+    ws3.append(["nama", "tingkat"])
+    for c in classes:
+        ws3.append([c.get("name", ""), c.get("grade", "")])
+    if not classes:
+        for n, g in [("X-1", "X"), ("X-2", "X"), ("XI-1", "XI"), ("XII-1", "XII")]:
+            ws3.append([n, g])
+    style_header(ws3, 2)
+    ws3.column_dimensions["A"].width = 18
+    ws3.column_dimensions["B"].width = 12
+    dv_grade = DataValidation(type="list", formula1='"X,XI,XII"', allow_blank=True)
+    dv_grade.error = "Tingkat harus X / XI / XII"
+    dv_grade.prompt = "Pilih tingkat"
+    ws3.add_data_validation(dv_grade)
+    dv_grade.add(f"B2:B{max(ws3.max_row + 50, 100)}")
+
+    # --- Penugasan_Matrix (format pivot user) ---
+    ws4 = wb.create_sheet("Penugasan_Matrix")
+    class_names = [c["name"] for c in classes] or ["X-1", "X-2", "XI-1", "XI-2", "XII-1", "XII-2"]
+    header = ["NO", "NAMA GURU", "MATA PELAJARAN"] + class_names + ["JUMLAH"]
+    ws4.append(header)
+    # Pivot assignments -> matrix rows
+    pivot: Dict[tuple, Dict[str, int]] = {}
+    for a in assignments:
+        t = t_by_id.get(a.get("teacher_id"))
+        s = s_by_id.get(a.get("subject_id"))
+        c = c_by_id.get(a.get("class_id"))
+        if not t or not s or not c:
+            continue
+        key = (t["name"], s["name"])
+        pivot.setdefault(key, {})[c["name"]] = a.get("hours_per_week", 0)
+    rno = 0
+    for (tname, sname), per_class in sorted(pivot.items()):
+        rno += 1
+        ws4.append([rno, tname, sname] + [per_class.get(cn, "") for cn in class_names] + [None])
+    if rno == 0:  # contoh 2 baris bila DB kosong
+        ws4.append([1, "Drs. Dadang Ahmad Tajudin", "Matematika"] + [2, 2, "", 2, 2, "", None][:len(class_names)] + [None])
+    first_empty = ws4.max_row + 1
+    for i in range(20):  # baris kosong siap isi
+        rno += 1
+        ws4.append([rno, "", ""] + [""] * len(class_names) + [None])
+    # Formula JUMLAH = SUM(kolom kelas)
+    jml_col = len(header)  # 1-based
+    first_class_col = 4
+    last_class_col = 3 + len(class_names)
+    for r in range(2, ws4.max_row + 1):
+        ws4.cell(row=r, column=jml_col).value = (
+            f"=SUM({get_column_letter(first_class_col)}{r}:{get_column_letter(last_class_col)}{r})"
+        )
+        ws4.cell(row=r, column=jml_col).alignment = center
+    style_header(ws4, len(header))
+    ws4.column_dimensions["A"].width = 6
+    ws4.column_dimensions["B"].width = 34
+    ws4.column_dimensions["C"].width = 24
+    for c in range(first_class_col, last_class_col + 1):
+        ws4.column_dimensions[get_column_letter(c)].width = 10
+    ws4.column_dimensions[get_column_letter(jml_col)].width = 10
+    dv_jp = DataValidation(type="whole", operator="between", formula1="0", formula2="40", allow_blank=True)
+    dv_jp.error = "JP harus bilangan 0-40 (kosong = tidak mengajar)"
+    dv_jp.prompt = "Isi JP 0-40"
+    ws4.add_data_validation(dv_jp)
+    dv_jp.add(f"{get_column_letter(first_class_col)}2:{get_column_letter(last_class_col)}{ws4.max_row + 50}")
+    _ = first_empty  # penanda baris contoh vs kosong (tak dipakai di server)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=template_import_jadwal.xlsx"},
+    )
+
+
+@api_router.post("/import/workbook")
+async def upload_unified_workbook(request: Request, file: UploadFile = File(...)):
+    """Upload SEKALI 1 file .xlsx terpadu (Guru/Mapel/Kelas/Penugasan_Matrix).
+
+    - Sheet master opsional; bila tidak ada, master dibuat otomatis dari matrix.
+    - Sheet matrix format pivot (NAMA GURU | MATA PELAJARAN | kolom-kolom kelas = JP).
+    - Juga menerima format panjang (nama_guru, mata_pelajaran, kelas, jp) bila
+      sheet matrix ternyata berheader long-format.
+    """
+    await require_user(request)
+    fname = (file.filename or "").lower()
+    if not fname.endswith((".xlsx", ".xlsm")):
+        raise HTTPException(status_code=400, detail="File harus berformat .xlsx (gunakan Template Terpadu)")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="File kosong")
+    try:
+        import openpyxl
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl belum terinstal di server")
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True, read_only=False)
+    except Exception:
+        raise HTTPException(status_code=400, detail="File .xlsx tidak valid / rusak")
+
+    def rows_of(ws):
+        out = []
+        for row in ws.iter_rows(values_only=True):
+            vals = [( "" if v is None else str(v).strip()) for v in row]
+            if any(vals):
+                out.append(vals)
+        return out
+
+    sheets = {ws.title: rows_of(ws) for ws in wb.worksheets}
+    norm_map = {_norm_sheet_name(t): t for t in sheets}
+
+    def pick(*names):
+        for n in names:
+            if n in norm_map:
+                return norm_map[n]
+        return None
+
+    guru_sheet = pick("guru", "gurus", "teacher", "teachers", "dataguru", "masterguru")
+    mapel_sheet = pick("mapel", "mapels", "subject", "subjects", "matapelajaran", "pelajaran")
+    mapel_sheet = mapel_sheet or pick("pelajaran")
+    kelas_sheet = pick("kelas", "class", "classes", "datakelas", "rombel", "masterkelas")
+    matrix_sheet = pick("penugasanmatrix", "penugasan", "tpenugasan", "assignments",
+                        "assignment", "teachingload", "bebanmengajar", "jadwal", "matrix")
+    if matrix_sheet is None and len(sheets) == 1:
+        matrix_sheet = next(iter(sheets))  # single-sheet = anggap matrix
+
+    summary: Dict[str, Any] = {"guru": {"added": 0, "updated": 0},
+                               "mapel": {"added": 0, "updated": 0},
+                               "kelas": {"added": 0, "updated": 0},
+                               "penugasan": {"added": 0, "updated": 0}}
+    errors: List[dict] = []
+
+    def push_err(sheet, row, msg):
+        if len(errors) < 80:
+            errors.append({"sheet": sheet, "row": row, "message": msg})
+
+    # ---- Master: guru ----
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(2000)
+    t_by_name = {t["name"].strip().lower(): t for t in teachers}
+    if guru_sheet:
+        rows = sheets[guru_sheet]
+        if rows:
+            hdr = [_norm_header(h) for h in rows[0]]
+            ci = {h: i for i, h in enumerate(hdr)}
+
+            def col(*names):
+                for n in names:
+                    if n in ci:
+                        return ci[n]
+                return None
+
+            c_nama = col("nama", "name", "namalengkap", "nama lengkap", "guru")
+            c_email = col("email", "e-mail")
+            c_wa = col("whatsapp", "wa", "nowa", "telepon", "phone")
+            c_jp = col("max_jp_per_minggu", "maxjpperm", "maxjp", "maksjp",
+                       "maxhoursperweek", "maxhours", "jpmaks", "jp per minggu", "maks jp")
+            # fallback: header persis template
+            if c_jp is None:
+                for i, h in enumerate(hdr):
+                    if "max" in h and "jp" in h or "max" in h and "hour" in h:
+                        c_jp = i
+                        break
+            c_note = col("catatan", "notes", "note", "keterangan")
+            if c_nama is None:
+                raise HTTPException(status_code=400, detail=f"Sheet Guru: header 'nama' tidak ditemukan")
+            for i, r in enumerate(rows[1:], start=2):
+                def get(cidx):
+                    return r[cidx].strip() if cidx is not None and cidx < len(r) else ""
+                name = get(c_nama)
+                if not name:
+                    continue
+                jp_raw = get(c_jp) or "24"
+                try:
+                    jp = int(float(jp_raw.replace(",", ".")))
+                except (ValueError, TypeError):
+                    push_err(guru_sheet, i, f"Maks JP tidak valid: '{jp_raw}'")
+                    continue
+                if jp < 1 or jp > 60:
+                    push_err(guru_sheet, i, f"Maks JP di luar 1-60: '{jp_raw}'")
+                    continue
+                key = name.lower()
+                if key in t_by_name:
+                    await db.teachers.update_one(
+                        {"id": t_by_name[key]["id"]},
+                        {"$set": {"name": name, "email": get(c_email), "whatsapp": get(c_wa),
+                                  "max_hours_per_week": jp, "notes": get(c_note)}},
+                    )
+                    summary["guru"]["updated"] += 1
+                else:
+                    doc = {"id": new_id("t"), "name": name, "email": get(c_email),
+                           "whatsapp": get(c_wa), "max_hours_per_week": jp,
+                           "notes": get(c_note), "availability": _default_teacher_availability()}
+                    await db.teachers.insert_one(doc)
+                    t_by_name[key] = doc
+                    summary["guru"]["added"] += 1
+
+    # ---- Master: mapel ----
+    subjects = await db.subjects.find({}, {"_id": 0}).to_list(2000)
+    s_by_name = {s["name"].strip().lower(): s for s in subjects}
+    color_i = len(subjects) % len(SUBJECT_COLOR_PALETTE)
+    if mapel_sheet:
+        rows = sheets[mapel_sheet]
+        if rows:
+            hdr = [_norm_header(h) for h in rows[0]]
+            ci = {h: i for i, h in enumerate(hdr)}
+
+            def col(*names):
+                for n in names:
+                    if n in ci:
+                        return ci[n]
+                return None
+
+            c_nama = col("nama", "name", "mapel", "matapelajaran", "mata pelajaran")
+            c_kode = col("kode", "code", "singkatan")
+            c_warna = col("warna", "color", "colour")
+            if c_nama is None:
+                raise HTTPException(status_code=400, detail="Sheet Mapel: header 'nama' tidak ditemukan")
+            for i, r in enumerate(rows[1:], start=2):
+                def get(cidx):
+                    return r[cidx].strip() if cidx is not None and cidx < len(r) else ""
+                name = get(c_nama)
+                if not name:
+                    continue
+                color = get(c_warna) or SUBJECT_COLOR_PALETTE[color_i % len(SUBJECT_COLOR_PALETTE)]
+                if not (color.startswith("#") and len(color) in (4, 7)):
+                    push_err(mapel_sheet, i, f"Warna tidak valid '{color}', dipakai default")
+                    color = SUBJECT_COLOR_PALETTE[color_i % len(SUBJECT_COLOR_PALETTE)]
+                key = name.lower()
+                if key in s_by_name:
+                    await db.subjects.update_one(
+                        {"id": s_by_name[key]["id"]},
+                        {"$set": {"name": name, "code": get(c_kode), "color": color}},
+                    )
+                    summary["mapel"]["updated"] += 1
+                else:
+                    doc = {"id": new_id("s"), "name": name, "code": get(c_kode), "color": color}
+                    await db.subjects.insert_one(doc)
+                    s_by_name[key] = doc
+                    summary["mapel"]["added"] += 1
+                    color_i += 1
+
+    # ---- Master: kelas ----
+    classes = await db.classes.find({}, {"_id": 0}).to_list(2000)
+    c_by_name = {c["name"].strip().lower(): c for c in classes}
+    if kelas_sheet:
+        rows = sheets[kelas_sheet]
+        if rows:
+            hdr = [_norm_header(h) for h in rows[0]]
+            ci = {h: i for i, h in enumerate(hdr)}
+
+            def col(*names):
+                for n in names:
+                    if n in ci:
+                        return ci[n]
+                return None
+
+            c_nama = col("nama", "name", "kelas", "class", "namakelas")
+            c_tkt = col("tingkat", "grade", "jenjang")
+            if c_nama is None:
+                raise HTTPException(status_code=400, detail="Sheet Kelas: header 'nama' tidak ditemukan")
+            for i, r in enumerate(rows[1:], start=2):
+                def get(cidx):
+                    return r[cidx].strip() if cidx is not None and cidx < len(r) else ""
+                name = get(c_nama)
+                if not name:
+                    continue
+                grade = _normalize_grade(get(c_tkt)) if c_tkt is not None else _infer_grade(name)
+                if not grade:
+                    push_err(kelas_sheet, i, f"Tingkat tidak valid: '{get(c_tkt)}' (isi X/XI/XII)")
+                    continue
+                key = name.lower()
+                if key in c_by_name:
+                    await db.classes.update_one({"id": c_by_name[key]["id"]},
+                                                {"$set": {"name": name, "grade": grade}})
+                    summary["kelas"]["updated"] += 1
+                else:
+                    doc = {"id": new_id("c"), "name": name, "grade": grade}
+                    await db.classes.insert_one(doc)
+                    c_by_name[key] = doc
+                    summary["kelas"]["added"] += 1
+
+    # refresh maps (master baru dari sheet ikut dipakai matrix)
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(2000)
+    subjects = await db.subjects.find({}, {"_id": 0}).to_list(2000)
+    classes = await db.classes.find({}, {"_id": 0}).to_list(2000)
+    t_by_name = {t["name"].strip().lower(): t for t in teachers}
+    s_by_name = {s["name"].strip().lower(): s for s in subjects}
+    c_by_name = {c["name"].strip().lower(): c for c in classes}
+
+    # ---- Penugasan (matrix pivot ATAU long-format) ----
+    if matrix_sheet:
+        ws = wb[matrix_sheet]
+        # cari baris header dalam 5 baris pertama (antisipasi judul di atas tabel)
+        header_row_idx, headers = None, None
+        for r in range(1, min(6, ws.max_row + 1)):
+            vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+            normed = [_norm_header(v) for v in vals]
+            has_guru = any(h in ("namaguru", "nama guru", "guru", "teacher", "nama") for h in normed)
+            has_mapel = any(h in ("matapelajaran", "mata pelajaran", "mapel", "subject", "pelajaran") for h in normed)
+            if has_guru and has_mapel:
+                header_row_idx, headers = r, [("" if v is None else str(v).strip()) for v in vals]
+                break
+        if headers is None:
+            raise HTTPException(status_code=400,
+                                detail=f"Sheet {matrix_sheet}: header NAMA GURU + MATA PELAJARAN tidak ditemukan (5 baris pertama)")
+
+        # Long-format? (header mengandung nama_guru/kelas/jp)
+        long_norm = [_norm_header(h) for h in headers]
+        is_long = any(h in ("namaguru", "nama_guru", "guru") for h in long_norm) and "kelas" in long_norm
+        existing = await db.assignments.find({}, {"_id": 0}).to_list(5000)
+        exist_key = {(a["teacher_id"], a["subject_id"], a["class_id"]): a for a in existing}
+
+        async def ensure_teacher(name: str):
+            t = t_by_name.get(name.lower())
+            if t:
+                return t
+            doc = {"id": new_id("t"), "name": name, "email": "", "whatsapp": "",
+                   "max_hours_per_week": 24, "notes": "Auto-dibuat dari import workbook",
+                   "availability": _default_teacher_availability()}
+            await db.teachers.insert_one(doc)
+            t_by_name[name.lower()] = doc
+            summary["guru"]["added"] += 1
+            return doc
+
+        async def ensure_subject(name: str):
+            s = s_by_name.get(name.lower())
+            if s:
+                return s
+            color = SUBJECT_COLOR_PALETTE[len(s_by_name) % len(SUBJECT_COLOR_PALETTE)]
+            doc = {"id": new_id("s"), "name": name, "code": "", "color": color}
+            await db.subjects.insert_one(doc)
+            s_by_name[name.lower()] = doc
+            summary["mapel"]["added"] += 1
+            return doc
+
+        async def ensure_class(name: str):
+            c = c_by_name.get(name.lower())
+            if c:
+                return c
+            doc = {"id": new_id("c"), "name": name, "grade": _infer_grade(name)}
+            await db.classes.insert_one(doc)
+            c_by_name[name.lower()] = doc
+            summary["kelas"]["added"] += 1
+            return doc
+
+        def parse_jp(v, sheet, excel_row):
+            if v is None or (isinstance(v, str) and not v.strip()) or v == "":
+                return 0
+            try:
+                jp = int(float(str(v).strip().replace(",", ".")))
+            except (ValueError, TypeError):
+                push_err(sheet, excel_row, f"JP tidak valid: '{v}' (harus angka 0-40)")
+                return None
+            if jp < 0 or jp > 40:
+                push_err(sheet, excel_row, f"JP di luar 0-40: '{v}'")
+                return None
+            return jp
+
+        if is_long:
+            # format panjang: cari indeks kolom
+            idx = {h: i for i, h in enumerate(long_norm)}
+            ci_g = next((idx[h] for h in ("namaguru", "nama_guru", "guru") if h in idx), None)
+            ci_m = next((idx[h] for h in ("matapelajaran", "mata_pelajaran", "mapel", "subject") if h in idx), None)
+            ci_c, ci_j = idx.get("kelas"), next((idx.get(h) for h in ("jp_per_minggu", "jpperm", "jp", "hours") if h in idx), None)
+            for excel_row in range(header_row_idx + 1, ws.max_row + 1):
+                vals = [ws.cell(row=excel_row, column=c).value for c in range(1, len(headers) + 1)]
+
+                def gv(i):
+                    return "" if i is None or i >= len(vals) or vals[i] is None else str(vals[i]).strip()
+                tname, sname, cname, jp_raw = gv(ci_g), gv(ci_m), gv(ci_c), vals[ci_j] if ci_j is not None and ci_j < len(vals) else ""
+                if not (tname or sname or cname or jp_raw):
+                    continue
+                if not (tname and sname and cname):
+                    push_err(matrix_sheet, excel_row, "Guru/mapel/kelas wajib diisi")
+                    continue
+                jp = parse_jp(jp_raw, matrix_sheet, excel_row)
+                if jp is None or jp == 0:
+                    continue
+                t = await ensure_teacher(tname)
+                s = await ensure_subject(sname)
+                c = await ensure_class(cname)
+                key = (t["id"], s["id"], c["id"])
+                if key in exist_key:
+                    await db.assignments.update_one({"id": exist_key[key]["id"]}, {"$set": {"hours_per_week": jp}})
+                    summary["penugasan"]["updated"] += 1
+                else:
+                    doc = {"id": new_id("a"), "teacher_id": t["id"], "subject_id": s["id"],
+                           "class_id": c["id"], "hours_per_week": jp}
+                    await db.assignments.insert_one(doc)
+                    exist_key[key] = doc
+                    summary["penugasan"]["added"] += 1
+        else:
+            layout = _find_matrix_layout(headers)
+            if layout is None:
+                raise HTTPException(status_code=400,
+                                    detail=f"Sheet {matrix_sheet}: kolom kelas tidak terdeteksi (tambah kolom nama kelas setelah MATA PELAJARAN)")
+            gi, mi, class_cols = layout
+            for excel_row in range(header_row_idx + 1, ws.max_row + 1):
+                vals = [ws.cell(row=excel_row, column=c).value for c in range(1, len(headers) + 1)]
+
+                def gv(i):
+                    return "" if i >= len(vals) or vals[i] is None else str(vals[i]).strip()
+                tname, sname = gv(gi), gv(mi)
+                if not tname and not sname:
+                    continue  # baris kosong
+                if not tname or not sname:
+                    push_err(matrix_sheet, excel_row, "NAMA GURU & MATA PELAJARAN wajib diisi")
+                    continue
+                t = await ensure_teacher(tname)
+                s = await ensure_subject(sname)
+                for ci, cname in class_cols:
+                    cell = vals[ci] if ci < len(vals) else None
+                    jp = parse_jp(cell, matrix_sheet, excel_row)
+                    if jp is None or jp == 0:
+                        continue
+                    c = await ensure_class(cname)
+                    key = (t["id"], s["id"], c["id"])
+                    if key in exist_key:
+                        await db.assignments.update_one({"id": exist_key[key]["id"]},
+                                                        {"$set": {"hours_per_week": jp}})
+                        summary["penugasan"]["updated"] += 1
+                    else:
+                        doc = {"id": new_id("a"), "teacher_id": t["id"], "subject_id": s["id"],
+                               "class_id": c["id"], "hours_per_week": jp}
+                        await db.assignments.insert_one(doc)
+                        exist_key[key] = doc
+                        summary["penugasan"]["added"] += 1
+
+    return {"ok": True, "summary": summary, "errors": errors, "skipped": len(errors)}
 
 
 # ---------------- Schedule ----------------
@@ -578,6 +1690,20 @@ async def dashboard_stats(request: Request):
 
 
 # ---------------- Seed ----------------
+@api_router.post("/reset-all")
+async def reset_all_data(request: Request):
+    """Hapus SEMUA data input: guru, mapel, kelas, penugasan, jadwal.
+
+    Koleksi users/sessions & day_configs TIDAK dihapus (data sistem).
+    """
+    await require_user(request)
+    out = {}
+    for coll in ("teachers", "subjects", "classes", "assignments", "schedule"):
+        r = await db[coll].delete_many({})
+        out[coll] = r.deleted_count
+    return {"ok": True, "deleted": out}
+
+
 def build_availability(rules: List[dict]) -> Dict[str, str]:
     """Build availability dict from rules list of {days: [], slots: [], status: 'unavailable'}.
     Default is 'available'."""

@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import api from "@/lib/api";
-import { Plus, Trash2, Users2, Edit3 } from "lucide-react";
+import { Plus, Trash2, Users2, Edit3, Download, Upload, FileUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -13,10 +14,20 @@ export default function Classes() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [form, setForm] = useState({ name: "", grade: "X" });
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef(null);
+  const [selected, setSelected] = useState([]);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
+  const toggleOne = (id) =>
+    setSelected((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  const toggleAll = () =>
+    setSelected((prev) => (prev.length === items.length && items.length > 0 ? [] : items.map((c) => c.id)));
 
   const load = async () => {
     const r = await api.get("/classes");
     setItems(r.data);
+    setSelected([]);
   };
   useEffect(() => { load(); }, []);
 
@@ -45,6 +56,69 @@ export default function Classes() {
     load();
   };
 
+  const bulkRemove = async () => {
+    if (selected.length === 0) return;
+    if (!window.confirm(`Hapus ${selected.length} kelas terpilih? Assignments & jadwal terkait ikut terhapus.`)) return;
+    setBulkDeleting(true);
+    try {
+      const res = await api.post("/classes/bulk-delete", { ids: selected });
+      toast.success(`${res.data.deleted_classes} kelas dihapus`);
+      load();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Gagal hapus massal");
+    } finally {
+      setBulkDeleting(false);
+    }
+  };
+
+  const downloadTemplate = async () => {
+    try {
+      const res = await api.get("/classes/template", { responseType: "blob" });
+      const url = window.URL.createObjectURL(new Blob([res.data], { type: "text/csv;charset=utf-8" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "template_classes.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.URL.revokeObjectURL(url);
+      toast.success("Template diunduh. Isi kolom nama, tingkat (X/XI/XII).");
+    } catch (e) {
+      toast.error("Gagal mengunduh template");
+    }
+  };
+
+  const handleUpload = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.name.toLowerCase().endsWith(".csv")) {
+      toast.error("File harus berformat .csv (gunakan template)");
+      e.target.value = "";
+      return;
+    }
+    setUploading(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await api.post("/classes/upload", fd, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      const { added = 0, updated = 0, errors = [] } = res.data || {};
+      if (errors.length > 0) {
+        const preview = errors.slice(0, 3).map((er) => `Baris ${er.row}: ${er.message}`).join("; ");
+        toast.warning(`Diimpor: ${added} baru, ${updated} diperbarui. ${errors.length} baris gagal. ${preview}`, { duration: 8000 });
+      } else {
+        toast.success(`Berhasil impor ${added} baru, ${updated} diperbarui`);
+      }
+      load();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Gagal mengunggah template");
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
+
   const grouped = { X: [], XI: [], XII: [] };
   items.forEach((c) => {
     if (!grouped[c.grade]) grouped[c.grade] = [];
@@ -58,7 +132,28 @@ export default function Classes() {
           <h1 className="text-3xl font-bold tracking-tight">Kelas</h1>
           <p className="text-sm text-slate-500 mt-1">Kelola daftar rombel per tingkat</p>
         </div>
-        <Dialog open={open} onOpenChange={setOpen}>
+        <div className="flex items-center gap-2 flex-wrap justify-end">
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".csv"
+            className="hidden"
+            data-testid="upload-classes-template-input"
+            onChange={handleUpload}
+          />
+          <Button data-testid="download-classes-template-btn" variant="outline" onClick={downloadTemplate}>
+            <Download size={16} className="mr-2" /> Unduh Template
+          </Button>
+          <Button
+            data-testid="upload-classes-template-btn"
+            variant="outline"
+            disabled={uploading}
+            onClick={() => fileRef.current?.click()}
+          >
+            {uploading ? <FileUp size={16} className="mr-2 animate-pulse" /> : <Upload size={16} className="mr-2" />}
+            {uploading ? "Mengunggah..." : "Unggah Template"}
+          </Button>
+          <Dialog open={open} onOpenChange={setOpen}>
           <DialogTrigger asChild>
             <Button data-testid="add-class-btn" onClick={openNew} className="bg-emerald-600 hover:bg-emerald-700 text-white">
               <Plus size={16} className="mr-2" /> Tambah Kelas
@@ -97,8 +192,38 @@ export default function Classes() {
               </Button>
             </DialogFooter>
           </DialogContent>
-        </Dialog>
+          </Dialog>
+        </div>
       </div>
+
+      {items.length > 0 && (
+        <div data-testid="bulk-bar" className="flex items-center gap-3 mb-4 px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm">
+          <Checkbox
+            data-testid="select-all"
+            checked={selected.length === items.length ? true : selected.length > 0 ? "indeterminate" : false}
+            onCheckedChange={toggleAll}
+          />
+          <span className="text-slate-600">
+            {selected.length > 0 ? `${selected.length} dipilih` : "Pilih semua"}
+          </span>
+          {selected.length > 0 && (
+            <>
+              <Button
+                data-testid="bulk-delete-btn"
+                size="sm"
+                disabled={bulkDeleting}
+                onClick={bulkRemove}
+                className="bg-red-600 hover:bg-red-700 text-white"
+              >
+                <Trash2 size={14} className="mr-1.5" /> {bulkDeleting ? "Menghapus..." : "Hapus Terpilih"}
+              </Button>
+              <button onClick={() => setSelected([])} className="text-xs text-slate-500 hover:text-slate-800 underline">
+                Batal
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
       <div className="space-y-6">
         {Object.entries(grouped).map(([grade, list]) => (
@@ -112,9 +237,15 @@ export default function Classes() {
                 <div
                   key={c.id}
                   data-testid={`class-${c.id}`}
-                  className="bg-white border border-slate-200 rounded-lg p-4 group relative"
+                  className={`bg-white border rounded-lg p-4 group relative transition-colors duration-150 ${selected.includes(c.id) ? "border-red-400 ring-1 ring-red-200" : "border-slate-200"}`}
                 >
                   <div className="flex items-start gap-3">
+                    <Checkbox
+                      data-testid={`select-class-${c.id}`}
+                      checked={selected.includes(c.id)}
+                      onCheckedChange={() => toggleOne(c.id)}
+                      className="mt-1"
+                    />
                     <div className="w-10 h-10 rounded-md bg-slate-100 text-slate-700 flex items-center justify-center shrink-0">
                       <Users2 size={16} />
                     </div>
