@@ -8,16 +8,11 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogTrigger } from "@/components/ui/dialog";
 import { toast } from "sonner";
 
-const COLOR_OPTIONS = [
-  "#059669", "#0EA5E9", "#F59E0B", "#8B5CF6", "#10B981",
-  "#EF4444", "#EC4899", "#F97316", "#3B82F6", "#84CC16",
-];
-
 export default function Subjects() {
   const [items, setItems] = useState([]);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
-  const [form, setForm] = useState({ name: "", code: "", color: "#059669" });
+  const [form, setForm] = useState({ name: "", code: "" });
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef(null);
   const [selected, setSelected] = useState([]);
@@ -37,12 +32,12 @@ export default function Subjects() {
 
   const openNew = () => {
     setEditing(null);
-    setForm({ name: "", code: "", color: "#059669" });
+    setForm({ name: "", code: "" });
     setOpen(true);
   };
   const openEdit = (s) => {
     setEditing(s);
-    setForm({ name: s.name, code: s.code || "", color: s.color || "#059669" });
+    setForm({ name: s.name, code: s.code || "" });
     setOpen(true);
   };
 
@@ -50,11 +45,11 @@ export default function Subjects() {
     if (!form.name.trim()) { toast.error("Nama wajib diisi"); return; }
     try {
       if (editing) {
-        await api.put(`/subjects/${editing.id}`, { ...editing, ...form });
+        await api.put(`/subjects/${editing.id}`, { ...editing, ...form, color: editing.color || "" });
         toast.success("Mata pelajaran diperbarui");
       } else {
-        await api.post("/subjects", form);
-        toast.success("Mata pelajaran ditambahkan");
+        await api.post("/subjects", { ...form, color: "" });
+        toast.success("Mata pelajaran ditambahkan (warna dibuat otomatis)");
       }
       setOpen(false);
       load();
@@ -94,7 +89,7 @@ export default function Subjects() {
       a.click();
       a.remove();
       window.URL.revokeObjectURL(url);
-      toast.success("Template diunduh. Isi kolom nama, kode, warna.");
+      toast.success("Template diunduh. Isi kolom nama dan kode (kode = primary key).");
     } catch (e) {
       toast.error("Gagal mengunduh template");
     }
@@ -180,28 +175,14 @@ export default function Subjects() {
                 />
               </div>
               <div>
-                <Label>Kode</Label>
+                <Label>Kode (Primary Key)</Label>
                 <Input
+                  data-testid="subject-code-input"
                   value={form.code}
                   onChange={(e) => setForm({ ...form, code: e.target.value })}
                   placeholder="MTK"
                 />
-              </div>
-              <div>
-                <Label>Warna</Label>
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {COLOR_OPTIONS.map((c) => (
-                    <button
-                      key={c}
-                      data-testid={`color-${c}`}
-                      onClick={() => setForm({ ...form, color: c })}
-                      className={`w-8 h-8 rounded-md border-2 transition-transform duration-150 ${
-                        form.color === c ? "border-slate-900 scale-110" : "border-transparent"
-                      }`}
-                      style={{ background: c }}
-                    />
-                  ))}
-                </div>
+                <p className="text-[11px] text-slate-400 mt-1">Kode dipakai sebagai acuan di template & jadwal. Warna dibuat otomatis.</p>
               </div>
             </div>
             <DialogFooter>

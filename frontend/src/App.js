@@ -109,7 +109,7 @@ function App() {
   return (
     <BrowserRouter>
       <AppRouter />
-      <Toaster richColors position="top-right" />
+      <Toaster richColors position="top-right" closeButton />
     </BrowserRouter>
   );
 }

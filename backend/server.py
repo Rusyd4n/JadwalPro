@@ -5,6 +5,8 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import csv
 import io
+import colorsys
+import json
 import os
 import logging
 import uuid
@@ -44,10 +46,10 @@ def new_id(prefix: str = "id") -> str:
 # ---------------- Models ----------------
 class Teacher(BaseModel):
     id: str = Field(default_factory=lambda: new_id("t"))
+    nomor: Optional[int] = None  # primary key tampil (kode guru di Views: 27/L)
     name: str
     email: Optional[str] = ""
     whatsapp: Optional[str] = ""
-    max_hours_per_week: int = 24
     # availability: dict keyed "Monday-1" -> "available" | "unavailable"
     availability: Dict[str, str] = Field(default_factory=dict)
     notes: Optional[str] = ""
@@ -64,6 +66,7 @@ class SchoolClass(BaseModel):
     id: str = Field(default_factory=lambda: new_id("c"))
     name: str
     grade: str  # X, XI, XII
+    wali_kelas_id: Optional[str] = ""  # relasi -> teachers.id
 
 
 class Assignment(BaseModel):
@@ -153,6 +156,33 @@ async def get_valid_slots_by_day() -> Dict[str, set]:
         periods = [i for i in c.get("items", []) if i.get("type") == "period"]
         result[c["day"]] = set(range(1, len(periods) + 1))
     return result
+
+
+async def get_breaks_after_map() -> Dict[str, set]:
+    """Petakan periode JP yang diikuti break, per hari.
+
+    Dipakai scheduler agar blok 2/3 JP tidak menyeberangi istirahat.
+    """
+    await ensure_day_configs()
+    configs = await db.day_configs.find({}, {"_id": 0}).to_list(20)
+    out: Dict[str, set] = {}
+    for cfg in configs:
+        items = cfg.get("items", [])
+        seen = set()
+        p = 0
+        idx = 0
+        while idx < len(items):
+            if items[idx].get("type") == "period":
+                p += 1
+                j = idx + 1
+                while j < len(items) and items[j].get("type") != "period":
+                    if items[j].get("type") == "break":
+                        seen.add(p)
+                        break
+                    j += 1
+            idx += 1
+        out[cfg["day"]] = seen
+    return out
 
 
 # ---------------- Auth ----------------
@@ -259,9 +289,16 @@ async def auth_logout(request: Request, response: Response):
 
 
 # ---------------- Teachers ----------------
+async def _next_teacher_nomor(exclude_id: Optional[str] = None) -> int:
+    docs = await db.teachers.find({}, {"_id": 0, "id": 1, "nomor": 1}).to_list(2000)
+    used = [d["nomor"] for d in docs if d.get("nomor") is not None and d["id"] != exclude_id]
+    return (max(used) if used else 0) + 1
+
+
 @api_router.get("/teachers", response_model=List[Teacher])
 async def list_teachers(request: Request):
     await require_user(request)
+    await ensure_teacher_numbers()
     docs = await db.teachers.find({}, {"_id": 0}).to_list(500)
     return [Teacher(**d) for d in docs]
 
@@ -270,8 +307,14 @@ async def list_teachers(request: Request):
 async def create_teacher(payload: Teacher, request: Request):
     await require_user(request)
     doc = payload.model_dump()
+    if doc.get("nomor") is None:
+        doc["nomor"] = await _next_teacher_nomor()
+    else:
+        clash = await db.teachers.find_one({"nomor": doc["nomor"]}, {"_id": 0})
+        if clash:
+            raise HTTPException(status_code=409, detail=f"Nomor {doc['nomor']} sudah dipakai {clash.get('name', '')}")
     await db.teachers.insert_one(doc)
-    return payload
+    return Teacher(**doc)
 
 
 @api_router.put("/teachers/{teacher_id}", response_model=Teacher)
@@ -279,6 +322,10 @@ async def update_teacher(teacher_id: str, payload: Teacher, request: Request):
     await require_user(request)
     doc = payload.model_dump()
     doc["id"] = teacher_id
+    if doc.get("nomor") is not None:
+        clash = await db.teachers.find_one({"nomor": doc["nomor"]}, {"_id": 0})
+        if clash and clash["id"] != teacher_id:
+            raise HTTPException(status_code=409, detail=f"Nomor {doc['nomor']} sudah dipakai {clash.get('name', '')}")
     await db.teachers.update_one({"id": teacher_id}, {"$set": doc}, upsert=True)
     return Teacher(**doc)
 
@@ -289,6 +336,7 @@ async def delete_teacher(teacher_id: str, request: Request):
     await db.teachers.delete_one({"id": teacher_id})
     await db.assignments.delete_many({"teacher_id": teacher_id})
     await db.schedule.delete_many({"teacher_id": teacher_id})
+    await db.classes.update_many({"wali_kelas_id": teacher_id}, {"$set": {"wali_kelas_id": ""}})
     return {"ok": True}
 
 
@@ -304,20 +352,69 @@ async def bulk_delete_teachers(payload: BulkDelete, request: Request):
     t = await db.teachers.delete_many({"id": {"$in": ids}})
     a = await db.assignments.delete_many({"teacher_id": {"$in": ids}})
     s = await db.schedule.delete_many({"teacher_id": {"$in": ids}})
+    await db.classes.update_many({"wali_kelas_id": {"$in": ids}}, {"$set": {"wali_kelas_id": ""}})
     return {"ok": True, "deleted_teachers": t.deleted_count,
             "deleted_assignments": a.deleted_count, "deleted_schedule": s.deleted_count}
 
 
-TEACHER_TEMPLATE_HEADERS = ["nama", "email", "whatsapp", "max_jp_per_minggu", "catatan"]
+TEACHER_TEMPLATE_HEADERS = ["nomor", "nama", "email", "whatsapp", "catatan"]
 
 
 def _default_teacher_availability() -> Dict[str, str]:
+    """Default guru BARU: semua slot 'unavailable' (off).
+
+    Admin wajib menyalakan (available) slot yang benar di Availability Matrix.
+    Mencegah scheduler menempatkan guru di jam yang belum dikonfirmasi.
+    """
     av: Dict[str, str] = {}
     for day in DAYS:
         slots = FRIDAY_SLOTS if day == "Friday" else REGULAR_SLOTS
         for s in slots:
-            av[f"{day}-{s}"] = "available"
+            av[f"{day}-{s}"] = "unavailable"
     return av
+
+
+async def ensure_teacher_numbers() -> None:
+    """Backfill nomor untuk guru lama yang belum punya (urut nama, lanjutkan max)."""
+    docs = await db.teachers.find({}, {"_id": 0}).to_list(2000)
+    used = {d["nomor"] for d in docs if d.get("nomor") is not None}
+    missing = sorted([d for d in docs if d.get("nomor") is None], key=lambda d: d.get("name", ""))
+    nxt = (max(used) if used else 0) + 1
+    for d in missing:
+        await db.teachers.update_one({"id": d["id"]}, {"$set": {"nomor": nxt}})
+        nxt += 1
+
+
+def auto_subject_color(index: int) -> str:
+    """Warna kontras deterministik via golden-angle hue rotation."""
+    h = ((index * 137.508) % 360) / 360.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.68, 0.62)
+    return "#%02X%02X%02X" % (int(r * 255), int(g * 255), int(b * 255))
+
+
+def resolve_teacher(maps: dict, value: str):
+    """Cari guru by nomor ('27', '27. Nama', '27 - Nama') atau nama lengkap."""
+    import re as _re
+    v = (value or "").strip()
+    if not v:
+        return None
+    t_by_nomor, t_by_name = maps
+    if v.isdigit() and int(v) in t_by_nomor:
+        return t_by_nomor[int(v)]
+    m = _re.match(r"^(\d+)\s*[.\-–:)]\s+.+$", v)
+    if m and int(m.group(1)) in t_by_nomor:
+        return t_by_nomor[int(m.group(1))]
+    return t_by_name.get(v.lower())
+
+
+def resolve_subject(maps: dict, value: str):
+    """Cari mapel by kode dulu, lalu nama."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    s_by_code, s_by_name = maps
+    hit = s_by_code.get(v.lower()) or s_by_name.get(v.lower())
+    return hit
 
 
 def _decode_csv_bytes(raw: bytes) -> str:
@@ -394,7 +491,7 @@ async def download_teacher_template(request: Request):
 
 @api_router.post("/teachers/upload")
 async def upload_teachers(request: Request, file: UploadFile = File(...)):
-    """Unggah CSV guru. Duplikat nama (case-insensitive) akan di-update."""
+    """Unggah CSV guru. Cocokkan by nomor dulu, lalu nama."""
     await require_user(request)
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="File harus berformat .csv")
@@ -404,15 +501,14 @@ async def upload_teachers(request: Request, file: UploadFile = File(...)):
 
     def canon(h: str) -> str:
         h = (h or "").strip().lower()
+        if h in ("nomor", "no", "number", "kode_guru", "kode guru"):
+            return "nomor"
         if h in ("nama", "name", "nama_lengkap", "nama lengkap", "guru"):
             return "nama"
         if h in ("email", "e-mail"):
             return "email"
         if h in ("whatsapp", "wa", "no_wa", "telepon", "phone"):
             return "whatsapp"
-        if h in ("max_jp_per_minggu", "max_jp", "maks_jp", "max_hours_per_week",
-                 "max_hours", "jp_maks", "maks jp", "jp per minggu"):
-            return "max_jp_per_minggu"
         if h in ("catatan", "notes", "note", "keterangan"):
             return "catatan"
         return h
@@ -422,8 +518,12 @@ async def upload_teachers(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=400,
                             detail=f"Header kurang: nama. Header wajib: {', '.join(TEACHER_TEMPLATE_HEADERS)}")
 
+    await ensure_teacher_numbers()
     docs = await db.teachers.find({}, {"_id": 0}).to_list(1000)
+    by_nomor = {d["nomor"]: d for d in docs if d.get("nomor") is not None}
     by_name = {d["name"].strip().lower(): d for d in docs}
+    used_nomor = set(by_nomor)
+    nxt = (max(used_nomor) if used_nomor else 0) + 1
     added, updated = 0, 0
     errors: List[dict] = []
     for i, row in enumerate(reader, start=2):
@@ -434,31 +534,54 @@ async def upload_teachers(request: Request, file: UploadFile = File(...)):
         if not name:
             errors.append({"row": i, "message": "Nama wajib diisi"})
             continue
-        jp_raw = norm.get("max_jp_per_minggu", "") or "24"
-        try:
-            jp = int(float(str(jp_raw).replace(",", ".")))
-        except (ValueError, TypeError):
-            errors.append({"row": i, "message": f"Maks JP tidak valid: '{jp_raw}'"})
-            continue
-        if jp < 1 or jp > 60:
-            errors.append({"row": i, "message": f"Maks JP di luar rentang 1-60: '{jp_raw}'"})
-            continue
-        key = name.lower()
-        if key in by_name:
+        nomor_raw = norm.get("nomor", "")
+        nomor = None
+        if nomor_raw:
+            try:
+                nomor = int(float(str(nomor_raw).replace(",", ".")))
+            except (ValueError, TypeError):
+                errors.append({"row": i, "message": f"Nomor tidak valid: '{nomor_raw}'"})
+                continue
+        target = by_nomor.get(nomor) if nomor is not None else None
+        if target is None:
+            target = by_name.get(name.lower())
+        if target is not None:
+            if nomor is not None:
+                other = by_nomor.get(nomor)
+                if other is not None and other["id"] != target["id"]:
+                    errors.append({"row": i, "message": f"Nomor {nomor} milik {other.get('name', '')}, tapi nama cocok dengan {target.get('name', '')} — perbaiki file"})
+                    continue
+                name_hit = by_name.get(name.lower())
+                if name_hit is not None and name_hit["id"] != target["id"]:
+                    errors.append({"row": i, "message": f"Nama cocok dengan {name_hit.get('name', '')} (nomor {name_hit.get('nomor', '?')}), tapi nomor {nomor} milik {target.get('name', '')} — perbaiki file"})
+                    continue
+        if target is not None:
+            final_nomor = target.get("nomor")
+            if nomor is not None and nomor not in used_nomor:
+                final_nomor = nomor
+                used_nomor.add(nomor)
             await db.teachers.update_one(
-                {"id": by_name[key]["id"]},
-                {"$set": {"name": name, "email": norm.get("email", ""),
-                          "whatsapp": norm.get("whatsapp", ""),
-                          "max_hours_per_week": jp, "notes": norm.get("catatan", "")}},
+                {"id": target["id"]},
+                {"$set": {"nomor": final_nomor, "name": name, "email": norm.get("email", ""),
+                          "whatsapp": norm.get("whatsapp", ""), "notes": norm.get("catatan", "")}},
             )
+            if final_nomor is not None:
+                by_nomor[final_nomor] = {**target, "nomor": final_nomor, "name": name}
             updated += 1
         else:
-            doc = {"id": new_id("t"), "name": name, "email": norm.get("email", ""),
-                   "whatsapp": norm.get("whatsapp", ""), "max_hours_per_week": jp,
-                   "notes": norm.get("catatan", ""),
+            if nomor is None:
+                nomor = nxt
+                nxt += 1
+            if nomor in used_nomor:
+                errors.append({"row": i, "message": f"Nomor {nomor} sudah dipakai"})
+                continue
+            used_nomor.add(nomor)
+            doc = {"id": new_id("t"), "nomor": nomor, "name": name, "email": norm.get("email", ""),
+                   "whatsapp": norm.get("whatsapp", ""), "notes": norm.get("catatan", ""),
                    "availability": _default_teacher_availability()}
             await db.teachers.insert_one(doc)
-            by_name[key] = doc
+            by_nomor[nomor] = doc
+            by_name[name.lower()] = doc
             added += 1
     return {"ok": True, "added": added, "updated": updated, "errors": errors, "skipped": len(errors)}
 
@@ -474,8 +597,12 @@ async def list_subjects(request: Request):
 @api_router.post("/subjects", response_model=Subject)
 async def create_subject(payload: Subject, request: Request):
     await require_user(request)
-    await db.subjects.insert_one(payload.model_dump())
-    return payload
+    doc = payload.model_dump()
+    if not doc.get("color"):
+        count = await db.subjects.count_documents({})
+        doc["color"] = auto_subject_color(count)
+    await db.subjects.insert_one(doc)
+    return Subject(**doc)
 
 
 @api_router.delete("/subjects/{subject_id}")
@@ -503,23 +630,23 @@ async def bulk_delete_subjects(payload: BulkDelete, request: Request):
             "deleted_assignments": a.deleted_count, "deleted_schedule": s.deleted_count}
 
 
-SUBJECT_TEMPLATE_HEADERS = ["nama", "kode", "warna"]
+SUBJECT_TEMPLATE_HEADERS = ["nama", "kode"]
 
 
 @api_router.get("/subjects/template")
 async def download_subject_template(request: Request):
-    """Unduh template CSV untuk bulk input mata pelajaran."""
+    """Unduh template CSV untuk bulk input mata pelajaran. Kolom kode = PK."""
     await require_user(request)
     docs = await db.subjects.find({}, {"_id": 0}).to_list(500)
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(SUBJECT_TEMPLATE_HEADERS)
     if docs:
-        for d in docs[:3]:
-            writer.writerow([d.get("name", ""), d.get("code", ""), d.get("color", "#059669")])
+        for d in docs[:5]:
+            writer.writerow([d.get("name", ""), d.get("code", "")])
     else:
-        writer.writerow(["Matematika", "MTK", "#059669"])
-        writer.writerow(["Fiqih", "FQH", "#8B5CF6"])
+        writer.writerow(["Matematika", "MTK"])
+        writer.writerow(["Fiqih", "FQH"])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]),
@@ -530,7 +657,7 @@ async def download_subject_template(request: Request):
 
 @api_router.post("/subjects/upload")
 async def upload_subjects(request: Request, file: UploadFile = File(...)):
-    """Unggah CSV mata pelajaran. Duplikat nama akan di-update."""
+    """Unggah CSV mapel. Cocokkan by kode dulu (PK), lalu nama. Warna auto."""
     await require_user(request)
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="File harus berformat .csv")
@@ -544,8 +671,6 @@ async def upload_subjects(request: Request, file: UploadFile = File(...)):
             return "nama"
         if h in ("kode", "code", "singkatan"):
             return "kode"
-        if h in ("warna", "color", "colour"):
-            return "warna"
         return h
 
     mapped = {f: canon(f) for f in reader.fieldnames}
@@ -554,7 +679,9 @@ async def upload_subjects(request: Request, file: UploadFile = File(...)):
                             detail=f"Header kurang: nama. Header wajib: {', '.join(SUBJECT_TEMPLATE_HEADERS)}")
 
     docs = await db.subjects.find({}, {"_id": 0}).to_list(1000)
+    by_code = {str(d.get("code", "")).strip().lower(): d for d in docs if str(d.get("code", "")).strip()}
     by_name = {d["name"].strip().lower(): d for d in docs}
+    color_idx = len(docs)
     added, updated = 0, 0
     errors: List[dict] = []
     for i, row in enumerate(reader, start=2):
@@ -562,24 +689,30 @@ async def upload_subjects(request: Request, file: UploadFile = File(...)):
         if not any(norm.values()):
             continue
         name = norm.get("nama", "")
+        code = norm.get("kode", "")
         if not name:
             errors.append({"row": i, "message": "Nama wajib diisi"})
             continue
-        color = norm.get("warna", "") or "#059669"
-        if not color.startswith("#") or len(color) not in (4, 7):
-            errors.append({"row": i, "message": f"Warna tidak valid: '{color}' (contoh #059669)"})
-            continue
-        key = name.lower()
-        if key in by_name:
+        target = (by_code.get(code.lower()) if code else None) or by_name.get(name.lower())
+        if target is not None:
+            final_code = target.get("code", "") or code
+            if code and code.lower() not in by_code:
+                final_code = code
             await db.subjects.update_one(
-                {"id": by_name[key]["id"]},
-                {"$set": {"name": name, "code": norm.get("kode", ""), "color": color}},
+                {"id": target["id"]},
+                {"$set": {"name": name, "code": final_code}},
             )
+            if final_code:
+                by_code[final_code.lower()] = target
             updated += 1
         else:
-            doc = {"id": new_id("s"), "name": name, "code": norm.get("kode", ""), "color": color}
+            color = auto_subject_color(color_idx)
+            color_idx += 1
+            doc = {"id": new_id("s"), "name": name, "code": code, "color": color}
             await db.subjects.insert_one(doc)
-            by_name[key] = doc
+            if code:
+                by_code[code.lower()] = doc
+            by_name[name.lower()] = doc
             added += 1
     return {"ok": True, "added": added, "updated": updated, "errors": errors, "skipped": len(errors)}
 
@@ -624,7 +757,7 @@ async def bulk_delete_classes(payload: BulkDelete, request: Request):
             "deleted_assignments": a.deleted_count, "deleted_schedule": s.deleted_count}
 
 
-CLASS_TEMPLATE_HEADERS = ["nama", "tingkat"]
+CLASS_TEMPLATE_HEADERS = ["nama", "tingkat", "wali_kelas"]
 
 
 def _normalize_grade(v: str) -> Optional[str]:
@@ -640,19 +773,24 @@ def _normalize_grade(v: str) -> Optional[str]:
 
 @api_router.get("/classes/template")
 async def download_class_template(request: Request):
-    """Unduh template CSV untuk bulk input kelas."""
+    """Unduh template CSV untuk bulk input kelas. Kolom wali_kelas = nomor/nama guru."""
     await require_user(request)
+    await ensure_teacher_numbers()
     docs = await db.classes.find({}, {"_id": 0}).to_list(500)
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
+    t_by_id = {t["id"]: t for t in teachers}
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(CLASS_TEMPLATE_HEADERS)
     if docs:
-        for d in docs[:4]:
-            writer.writerow([d.get("name", ""), d.get("grade", "")])
+        for d in docs[:8]:
+            w = t_by_id.get(d.get("wali_kelas_id", ""), {})
+            wali = f"{w['nomor']}. {w['name']}" if w.get("nomor") else w.get("name", "")
+            writer.writerow([d.get("name", ""), d.get("grade", ""), wali])
     else:
-        writer.writerow(["X-1", "X"])
-        writer.writerow(["XI-1", "XI"])
-        writer.writerow(["XII-1", "XII"])
+        writer.writerow(["X-1", "X", ""])
+        writer.writerow(["XI-1", "XI", ""])
+        writer.writerow(["XII-1", "XII", ""])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]),
@@ -663,7 +801,7 @@ async def download_class_template(request: Request):
 
 @api_router.post("/classes/upload")
 async def upload_classes(request: Request, file: UploadFile = File(...)):
-    """Unggah CSV kelas. Duplikat nama akan di-update tingkatnya."""
+    """Unggah CSV kelas. Kolom wali_kelas = nomor/nama guru (opsional)."""
     await require_user(request)
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="File harus berformat .csv")
@@ -677,6 +815,8 @@ async def upload_classes(request: Request, file: UploadFile = File(...)):
             return "nama"
         if h in ("tingkat", "grade", "kelas_tingkat", "jenjang"):
             return "tingkat"
+        if h in ("wali_kelas", "wali kelas", "wali", "homeroom"):
+            return "wali_kelas"
         return h
 
     mapped = {f: canon(f) for f in reader.fieldnames}
@@ -684,6 +824,10 @@ async def upload_classes(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=400,
                             detail=f"Header kurang: nama. Header wajib: {', '.join(CLASS_TEMPLATE_HEADERS)}")
 
+    await ensure_teacher_numbers()
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(1000)
+    t_maps = ({t["nomor"]: t for t in teachers if t.get("nomor") is not None},
+              {t["name"].strip().lower(): t for t in teachers})
     docs = await db.classes.find({}, {"_id": 0}).to_list(1000)
     by_name = {d["name"].strip().lower(): d for d in docs}
     added, updated = 0, 0
@@ -700,12 +844,21 @@ async def upload_classes(request: Request, file: UploadFile = File(...)):
         if not grade:
             errors.append({"row": i, "message": f"Tingkat tidak valid: '{norm.get('tingkat', '')}' (isi X/XI/XII)"})
             continue
+        wali_id = ""
+        wali_raw = norm.get("wali_kelas", "")
+        if wali_raw:
+            wt = resolve_teacher(t_maps, wali_raw)
+            if not wt:
+                errors.append({"row": i, "message": f"Wali kelas tidak ditemukan: '{wali_raw}'"})
+                continue
+            wali_id = wt["id"]
         key = name.lower()
         if key in by_name:
-            await db.classes.update_one({"id": by_name[key]["id"]}, {"$set": {"name": name, "grade": grade}})
+            await db.classes.update_one({"id": by_name[key]["id"]},
+                                        {"$set": {"name": name, "grade": grade, "wali_kelas_id": wali_id}})
             updated += 1
         else:
-            doc = {"id": new_id("c"), "name": name, "grade": grade}
+            doc = {"id": new_id("c"), "name": name, "grade": grade, "wali_kelas_id": wali_id}
             await db.classes.insert_one(doc)
             by_name[key] = doc
             added += 1
@@ -794,8 +947,7 @@ async def download_assignment_template(request: Request):
 async def upload_assignments(request: Request, file: UploadFile = File(...)):
     """Unggah file CSV template assignments.
 
-    Menerima kolom: nama_guru, mata_pelajaran, kelas, jp_per_minggu
-    (alias didukung: guru, mapel/subject, class, jp/hours).
+    Guru dikenali by nomor dulu lalu nama; mapel by kode dulu lalu nama.
     Baris duplikat (guru+mapel+kelas sama) akan di-update JP-nya.
     """
     await require_user(request)
@@ -809,7 +961,7 @@ async def upload_assignments(request: Request, file: UploadFile = File(...)):
     # Normalisasi header -> key kanonis
     def canon(h: str) -> str:
         h = (h or "").strip().lower()
-        if h in ("nama_guru", "guru", "teacher", "nama guru"):
+        if h in ("nama_guru", "guru", "teacher", "nama guru", "nomor_guru", "nomor guru"):
             return "nama_guru"
         if h in ("mata_pelajaran", "mapel", "subject", "mata pelajaran", "pelajaran"):
             return "mata_pelajaran"
@@ -827,11 +979,14 @@ async def upload_assignments(request: Request, file: UploadFile = File(...)):
             detail=f"Header kurang: {', '.join(missing)}. Header wajib: {', '.join(ASSIGNMENT_TEMPLATE_HEADERS)}",
         )
 
+    await ensure_teacher_numbers()
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
     subjects = await db.subjects.find({}, {"_id": 0}).to_list(500)
     classes = await db.classes.find({}, {"_id": 0}).to_list(500)
-    teacher_map = {t["name"].strip().lower(): t for t in teachers}
-    subject_map = {s["name"].strip().lower(): s for s in subjects}
+    t_maps = ({t["nomor"]: t for t in teachers if t.get("nomor") is not None},
+              {t["name"].strip().lower(): t for t in teachers})
+    s_maps = ({str(s.get("code", "")).strip().lower(): s for s in subjects if str(s.get("code", "")).strip()},
+              {s["name"].strip().lower(): s for s in subjects})
     # kelas juga dikenali via code bila ada
     class_map = {}
     for c in classes:
@@ -855,13 +1010,13 @@ async def upload_assignments(request: Request, file: UploadFile = File(...)):
         c_name = norm.get("kelas", "")
         jp_raw = norm.get("jp_per_minggu", "")
 
-        teacher = teacher_map.get(t_name.lower())
+        teacher = resolve_teacher(t_maps, t_name)
         if not teacher:
-            errors.append({"row": i, "message": f"Guru tidak ditemukan: '{t_name}'"})
+            errors.append({"row": i, "message": f"Guru tidak ditemukan: '{t_name}' (isi nomor/nama sesuai template Guru)"})
             continue
-        subject = subject_map.get(s_name.lower())
+        subject = resolve_subject(s_maps, s_name)
         if not subject:
-            errors.append({"row": i, "message": f"Mata pelajaran tidak ditemukan: '{s_name}'"})
+            errors.append({"row": i, "message": f"Mata pelajaran tidak ditemukan: '{s_name}' (isi kode/nama sesuai template Mapel)"})
             continue
         school_class = class_map.get(c_name.lower())
         if not school_class:
@@ -975,6 +1130,9 @@ async def download_unified_template(request: Request):
     subjects = await db.subjects.find({}, {"_id": 0}).to_list(1000)
     classes = await db.classes.find({}, {"_id": 0}).to_list(500)
     assignments = await db.assignments.find({}, {"_id": 0}).to_list(5000)
+    await ensure_teacher_numbers()
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(1000)
+    teachers.sort(key=lambda t: (t.get("nomor") or 9999))
     order = {"X": 0, "XI": 1, "XII": 2}
     classes = sorted(classes, key=lambda c: (order.get(c.get("grade", "X"), 9), c.get("name", "")))
 
@@ -1005,13 +1163,13 @@ async def download_unified_template(request: Request):
     guide = [
         ["IMPORT TERPADU JADWALPRO — 1 FILE UNTUK SEMUA DATA"],
         [""],
-        ["1. Isi sheet Guru, Mapel, Kelas dahulu (atau biarkan — sheet Penugasan_Matrix"],
-        ["   bisa membuat data master baru otomatis saat upload)."],
+        ["1. Sheet Guru: kolom nomor = PRIMARY KEY guru (dipakai di Views & referensi)."],
+        ["   Sheet Mapel: kolom kode = PRIMARY KEY mapel. Sheet Kelas: wali_kelas = nomor/nama guru."],
         ["2. Isi sheet Penugasan_Matrix: tiap baris = 1 guru + 1 mapel, tiap kolom"],
-        ["   kelas = JP per minggu (kosongkan / isi 0 bila tidak mengajar)."],
+        ["   kelas = JP per minggu (kosongkan / isi 0 bila tidak mengajar). Kolom kelas"],
+        ["   mengikuti data Kelas saat ini. Guru boleh ditulis nomor saja ('27')."],
         ["3. Kolom JUMLAH terisi otomatis (formula). Jangan hapus header baris 1."],
-        ["4. Nama guru & mapel bebas (dibuat otomatis bila belum ada). Nama kelas"],
-        ["   baru otomatis dibuat dengan tingkat ditebak dari awalan (X/XI/XII)."],
+        ["4. Guru/mapel/kelas baru otomatis dibuat saat upload (warna mapel otomatis)."],
         ["5. Upload SEKALI di halaman Teaching Load → Unggah Terpadu (.xlsx)."],
         [""],
         ["Aturan: JP 0-40 (bilangan bulat). Tingkat hanya X / XI / XII."],
@@ -1024,39 +1182,42 @@ async def download_unified_template(request: Request):
 
     # --- Guru ---
     ws1 = wb.create_sheet("Guru")
-    ws1.append(["nama", "email", "whatsapp", "max_jp_per_minggu", "catatan"])
+    ws1.append(["nomor", "nama", "email", "whatsapp", "catatan"])
     for t in teachers:
-        ws1.append([t.get("name", ""), t.get("email", ""), t.get("whatsapp", ""),
-                    t.get("max_hours_per_week", 24), t.get("notes", "")])
+        ws1.append([t.get("nomor", ""), t.get("name", ""), t.get("email", ""),
+                    t.get("whatsapp", ""), t.get("notes", "")])
     if not teachers:
-        ws1.append(["Drs. Dadang Ahmad Tajudin", "", "081200000001", 24, "Contoh"])
+        ws1.append([1, "Drs. Dadang Ahmad Tajudin", "", "081200000001", "Contoh"])
     style_header(ws1, 5)
-    for w, col in zip([32, 24, 18, 20, 30], "ABCDE"):
+    for w, col in zip([10, 32, 24, 18, 30], "ABCDE"):
         ws1.column_dimensions[col].width = w
 
     # --- Mapel ---
     ws2 = wb.create_sheet("Mapel")
-    ws2.append(["nama", "kode", "warna"])
+    ws2.append(["nama", "kode"])
     for s in subjects:
-        ws2.append([s.get("name", ""), s.get("code", ""), s.get("color", "#059669")])
+        ws2.append([s.get("name", ""), s.get("code", "")])
     if not subjects:
-        ws2.append(["Matematika", "MTK", "#059669"])
-        ws2.append(["Fiqih", "FQH", "#8B5CF6"])
-    style_header(ws2, 3)
-    for w, col in zip([30, 12, 12], "ABC"):
+        ws2.append(["Matematika", "MTK"])
+        ws2.append(["Fiqih", "FQH"])
+    style_header(ws2, 2)
+    for w, col in zip([30, 12], "AB"):
         ws2.column_dimensions[col].width = w
 
     # --- Kelas ---
     ws3 = wb.create_sheet("Kelas")
-    ws3.append(["nama", "tingkat"])
+    ws3.append(["nama", "tingkat", "wali_kelas"])
     for c in classes:
-        ws3.append([c.get("name", ""), c.get("grade", "")])
+        w = t_by_id.get(c.get("wali_kelas_id", ""), {})
+        wali = f"{w['nomor']}. {w['name']}" if w.get("nomor") else w.get("name", "")
+        ws3.append([c.get("name", ""), c.get("grade", ""), wali])
     if not classes:
         for n, g in [("X-1", "X"), ("X-2", "X"), ("XI-1", "XI"), ("XII-1", "XII")]:
-            ws3.append([n, g])
-    style_header(ws3, 2)
+            ws3.append([n, g, ""])
+    style_header(ws3, 3)
     ws3.column_dimensions["A"].width = 18
     ws3.column_dimensions["B"].width = 12
+    ws3.column_dimensions["C"].width = 30
     dv_grade = DataValidation(type="list", formula1='"X,XI,XII"', allow_blank=True)
     dv_grade.error = "Tingkat harus X / XI / XII"
     dv_grade.prompt = "Pilih tingkat"
@@ -1182,9 +1343,12 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
         if len(errors) < 80:
             errors.append({"sheet": sheet, "row": row, "message": msg})
 
-    # ---- Master: guru ----
+    # ---- Master: guru (nomor = PK) ----
+    await ensure_teacher_numbers()
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(2000)
+    t_by_nomor = {t["nomor"]: t for t in teachers if t.get("nomor") is not None}
     t_by_name = {t["name"].strip().lower(): t for t in teachers}
+    t_nxt = (max(t_by_nomor) if t_by_nomor else 0) + 1
     if guru_sheet:
         rows = sheets[guru_sheet]
         if rows:
@@ -1197,17 +1361,10 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
                         return ci[n]
                 return None
 
+            c_nomor = col("nomor", "no", "number", "kode_guru", "kode guru")
             c_nama = col("nama", "name", "namalengkap", "nama lengkap", "guru")
             c_email = col("email", "e-mail")
             c_wa = col("whatsapp", "wa", "nowa", "telepon", "phone")
-            c_jp = col("max_jp_per_minggu", "maxjpperm", "maxjp", "maksjp",
-                       "maxhoursperweek", "maxhours", "jpmaks", "jp per minggu", "maks jp")
-            # fallback: header persis template
-            if c_jp is None:
-                for i, h in enumerate(hdr):
-                    if "max" in h and "jp" in h or "max" in h and "hour" in h:
-                        c_jp = i
-                        break
             c_note = col("catatan", "notes", "note", "keterangan")
             if c_nama is None:
                 raise HTTPException(status_code=400, detail=f"Sheet Guru: header 'nama' tidak ditemukan")
@@ -1217,35 +1374,57 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
                 name = get(c_nama)
                 if not name:
                     continue
-                jp_raw = get(c_jp) or "24"
-                try:
-                    jp = int(float(jp_raw.replace(",", ".")))
-                except (ValueError, TypeError):
-                    push_err(guru_sheet, i, f"Maks JP tidak valid: '{jp_raw}'")
-                    continue
-                if jp < 1 or jp > 60:
-                    push_err(guru_sheet, i, f"Maks JP di luar 1-60: '{jp_raw}'")
-                    continue
-                key = name.lower()
-                if key in t_by_name:
+                nomor = None
+                if c_nomor is not None and get(c_nomor):
+                    try:
+                        nomor = int(float(get(c_nomor).replace(",", ".")))
+                    except (ValueError, TypeError):
+                        push_err(guru_sheet, i, f"Nomor tidak valid: '{get(c_nomor)}'")
+                        continue
+                target = (t_by_nomor.get(nomor) if nomor is not None else None) or t_by_name.get(name.lower())
+                if target is not None and nomor is not None:
+                    other = t_by_nomor.get(nomor)
+                    if other is not None and other["id"] != target["id"]:
+                        push_err(guru_sheet, i, f"Nomor {nomor} milik {other.get('name', '')}, tapi nama cocok dengan {target.get('name', '')} — perbaiki file")
+                        continue
+                    name_hit = t_by_name.get(name.lower())
+                    if name_hit is not None and name_hit["id"] != target["id"]:
+                        push_err(guru_sheet, i, f"Nama cocok dengan {name_hit.get('name', '')} (nomor {name_hit.get('nomor', '?')}), tapi nomor {nomor} milik {target.get('name', '')} — perbaiki file")
+                        continue
+                if target is not None:
+                    final = target.get("nomor")
+                    if nomor is not None and nomor not in t_by_nomor:
+                        final = nomor
+                        t_nxt = max(t_nxt, nomor + 1)
                     await db.teachers.update_one(
-                        {"id": t_by_name[key]["id"]},
-                        {"$set": {"name": name, "email": get(c_email), "whatsapp": get(c_wa),
-                                  "max_hours_per_week": jp, "notes": get(c_note)}},
+                        {"id": target["id"]},
+                        {"$set": {"nomor": final, "name": name, "email": get(c_email),
+                                  "whatsapp": get(c_wa), "notes": get(c_note)}},
                     )
+                    if final is not None:
+                        t_by_nomor[final] = {**target, "nomor": final, "name": name}
                     summary["guru"]["updated"] += 1
                 else:
-                    doc = {"id": new_id("t"), "name": name, "email": get(c_email),
-                           "whatsapp": get(c_wa), "max_hours_per_week": jp,
-                           "notes": get(c_note), "availability": _default_teacher_availability()}
+                    if nomor is None:
+                        nomor = t_nxt
+                        t_nxt += 1
+                    if nomor in t_by_nomor:
+                        push_err(guru_sheet, i, f"Nomor {nomor} sudah dipakai")
+                        continue
+                    doc = {"id": new_id("t"), "nomor": nomor, "name": name, "email": get(c_email),
+                           "whatsapp": get(c_wa), "notes": get(c_note),
+                           "availability": _default_teacher_availability()}
                     await db.teachers.insert_one(doc)
-                    t_by_name[key] = doc
+                    t_by_nomor[nomor] = doc
+                    t_by_name[name.lower()] = doc
+                    t_nxt = max(t_nxt, nomor + 1)
                     summary["guru"]["added"] += 1
 
-    # ---- Master: mapel ----
+    # ---- Master: mapel (kode = PK, warna otomatis) ----
     subjects = await db.subjects.find({}, {"_id": 0}).to_list(2000)
+    s_by_code = {str(s.get("code", "")).strip().lower(): s for s in subjects if str(s.get("code", "")).strip()}
     s_by_name = {s["name"].strip().lower(): s for s in subjects}
-    color_i = len(subjects) % len(SUBJECT_COLOR_PALETTE)
+    color_idx = len(subjects)
     if mapel_sheet:
         rows = sheets[mapel_sheet]
         if rows:
@@ -1260,7 +1439,6 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
 
             c_nama = col("nama", "name", "mapel", "matapelajaran", "mata pelajaran")
             c_kode = col("kode", "code", "singkatan")
-            c_warna = col("warna", "color", "colour")
             if c_nama is None:
                 raise HTTPException(status_code=400, detail="Sheet Mapel: header 'nama' tidak ditemukan")
             for i, r in enumerate(rows[1:], start=2):
@@ -1269,23 +1447,28 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
                 name = get(c_nama)
                 if not name:
                     continue
-                color = get(c_warna) or SUBJECT_COLOR_PALETTE[color_i % len(SUBJECT_COLOR_PALETTE)]
-                if not (color.startswith("#") and len(color) in (4, 7)):
-                    push_err(mapel_sheet, i, f"Warna tidak valid '{color}', dipakai default")
-                    color = SUBJECT_COLOR_PALETTE[color_i % len(SUBJECT_COLOR_PALETTE)]
-                key = name.lower()
-                if key in s_by_name:
+                code = get(c_kode)
+                target = (s_by_code.get(code.lower()) if code else None) or s_by_name.get(name.lower())
+                if target is not None:
+                    final_code = target.get("code", "") or code
+                    if code and code.lower() not in s_by_code:
+                        final_code = code
                     await db.subjects.update_one(
-                        {"id": s_by_name[key]["id"]},
-                        {"$set": {"name": name, "code": get(c_kode), "color": color}},
+                        {"id": target["id"]},
+                        {"$set": {"name": name, "code": final_code}},
                     )
+                    if final_code:
+                        s_by_code[final_code.lower()] = target
                     summary["mapel"]["updated"] += 1
                 else:
-                    doc = {"id": new_id("s"), "name": name, "code": get(c_kode), "color": color}
+                    color = auto_subject_color(color_idx)
+                    color_idx += 1
+                    doc = {"id": new_id("s"), "name": name, "code": code, "color": color}
                     await db.subjects.insert_one(doc)
-                    s_by_name[key] = doc
+                    if code:
+                        s_by_code[code.lower()] = doc
+                    s_by_name[name.lower()] = doc
                     summary["mapel"]["added"] += 1
-                    color_i += 1
 
     # ---- Master: kelas ----
     classes = await db.classes.find({}, {"_id": 0}).to_list(2000)
@@ -1304,6 +1487,7 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
 
             c_nama = col("nama", "name", "kelas", "class", "namakelas")
             c_tkt = col("tingkat", "grade", "jenjang")
+            c_wali = col("walikelas", "wali kelas", "wali_kelas", "wali", "homeroom")
             if c_nama is None:
                 raise HTTPException(status_code=400, detail="Sheet Kelas: header 'nama' tidak ditemukan")
             for i, r in enumerate(rows[1:], start=2):
@@ -1316,13 +1500,21 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
                 if not grade:
                     push_err(kelas_sheet, i, f"Tingkat tidak valid: '{get(c_tkt)}' (isi X/XI/XII)")
                     continue
+                wali_id = ""
+                if c_wali is not None and get(c_wali):
+                    wt = resolve_teacher((t_by_nomor, t_by_name), get(c_wali))
+                    if not wt:
+                        push_err(kelas_sheet, i, f"Wali kelas tidak ditemukan: '{get(c_wali)}'")
+                        continue
+                    wali_id = wt["id"]
                 key = name.lower()
                 if key in c_by_name:
                     await db.classes.update_one({"id": c_by_name[key]["id"]},
-                                                {"$set": {"name": name, "grade": grade}})
+                                                {"$set": {"name": name, "grade": grade,
+                                                          "wali_kelas_id": wali_id}})
                     summary["kelas"]["updated"] += 1
                 else:
-                    doc = {"id": new_id("c"), "name": name, "grade": grade}
+                    doc = {"id": new_id("c"), "name": name, "grade": grade, "wali_kelas_id": wali_id}
                     await db.classes.insert_one(doc)
                     c_by_name[key] = doc
                     summary["kelas"]["added"] += 1
@@ -1331,9 +1523,13 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(2000)
     subjects = await db.subjects.find({}, {"_id": 0}).to_list(2000)
     classes = await db.classes.find({}, {"_id": 0}).to_list(2000)
+    t_by_nomor = {t["nomor"]: t for t in teachers if t.get("nomor") is not None}
     t_by_name = {t["name"].strip().lower(): t for t in teachers}
+    t_nxt = (max(t_by_nomor) if t_by_nomor else 0) + 1
+    s_by_code = {str(s.get("code", "")).strip().lower(): s for s in subjects if str(s.get("code", "")).strip()}
     s_by_name = {s["name"].strip().lower(): s for s in subjects}
     c_by_name = {c["name"].strip().lower(): c for c in classes}
+    color_idx = len(subjects)
 
     # ---- Penugasan (matrix pivot ATAU long-format) ----
     if matrix_sheet:
@@ -1358,26 +1554,34 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
         existing = await db.assignments.find({}, {"_id": 0}).to_list(5000)
         exist_key = {(a["teacher_id"], a["subject_id"], a["class_id"]): a for a in existing}
 
-        async def ensure_teacher(name: str):
-            t = t_by_name.get(name.lower())
+        async def ensure_teacher_from_value(value: str):
+            t = resolve_teacher((t_by_nomor, t_by_name), value)
             if t:
                 return t
-            doc = {"id": new_id("t"), "name": name, "email": "", "whatsapp": "",
-                   "max_hours_per_week": 24, "notes": "Auto-dibuat dari import workbook",
+            nonlocal t_nxt
+            doc = {"id": new_id("t"), "nomor": t_nxt, "name": value.strip(), "email": "",
+                   "whatsapp": "", "notes": "Auto-dibuat dari import workbook",
                    "availability": _default_teacher_availability()}
             await db.teachers.insert_one(doc)
-            t_by_name[name.lower()] = doc
+            t_by_nomor[t_nxt] = doc
+            t_by_name[value.strip().lower()] = doc
+            t_nxt += 1
             summary["guru"]["added"] += 1
             return doc
 
-        async def ensure_subject(name: str):
-            s = s_by_name.get(name.lower())
+        async def ensure_teacher(value: str):
+            return await ensure_teacher_from_value(value)
+
+        async def ensure_subject(value: str):
+            s = resolve_subject((s_by_code, s_by_name), value)
             if s:
                 return s
-            color = SUBJECT_COLOR_PALETTE[len(s_by_name) % len(SUBJECT_COLOR_PALETTE)]
-            doc = {"id": new_id("s"), "name": name, "code": "", "color": color}
+            nonlocal color_idx
+            color = auto_subject_color(color_idx)
+            color_idx += 1
+            doc = {"id": new_id("s"), "name": value.strip(), "code": "", "color": color}
             await db.subjects.insert_one(doc)
-            s_by_name[name.lower()] = doc
+            s_by_name[value.strip().lower()] = doc
             summary["mapel"]["added"] += 1
             return doc
 
@@ -1385,7 +1589,7 @@ async def upload_unified_workbook(request: Request, file: UploadFile = File(...)
             c = c_by_name.get(name.lower())
             if c:
                 return c
-            doc = {"id": new_id("c"), "name": name, "grade": _infer_grade(name)}
+            doc = {"id": new_id("c"), "name": name, "grade": _infer_grade(name), "wali_kelas_id": ""}
             await db.classes.insert_one(doc)
             c_by_name[name.lower()] = doc
             summary["kelas"]["added"] += 1
@@ -1548,8 +1752,44 @@ async def get_schedule(request: Request):
 
 
 @api_router.post("/schedule")
-async def upsert_slot(payload: ScheduleSlot, request: Request):
+async def upsert_slot(payload: ScheduleSlot, request: Request, force: bool = False):
+    """Tempatkan 1 slot manual dengan validasi constraint.
+
+    - Guru double-booked (kelas lain di day+slot sama): SELALU ditolak (409).
+    - Guru unavailable / slot invalid: ditolak (409) kecuali force=true.
+    """
     await require_user(request)
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
+    classes = await db.classes.find({}, {"_id": 0}).to_list(500)
+    teacher_map = {t["id"]: t for t in teachers}
+    class_map = {c["id"]: c for c in classes}
+    valid_slots_by_day = await get_valid_slots_by_day()
+
+    teacher = teacher_map.get(payload.teacher_id)
+    tname = teacher["name"] if teacher else payload.teacher_id
+    valid = valid_slots_by_day.get(payload.day)
+    if valid is not None and payload.slot not in valid:
+        raise HTTPException(status_code=409, detail={
+            "code": "invalid_slot", "can_force": False,
+            "message": f"{payload.day} JP{payload.slot} tidak ada dalam konfigurasi hari ini",
+        })
+    clash = await db.schedule.find_one({
+        "teacher_id": payload.teacher_id,
+        "day": payload.day,
+        "slot": payload.slot,
+        "class_id": {"$ne": payload.class_id},
+    }, {"_id": 0})
+    if clash:
+        other = class_map.get(clash["class_id"], {}).get("name", clash["class_id"])
+        raise HTTPException(status_code=409, detail={
+            "code": "teacher_double_booked", "can_force": False,
+            "message": f"{tname} sudah mengajar kelas {other} pada {payload.day} JP{payload.slot}",
+        })
+    if teacher and teacher.get("availability", {}).get(f"{payload.day}-{payload.slot}") == "unavailable" and not force:
+        raise HTTPException(status_code=409, detail={
+            "code": "availability_violation", "can_force": True,
+            "message": f"{tname} tidak tersedia pada {payload.day} JP{payload.slot}",
+        })
     # remove any existing slot for that class+day+slot (class-owns-slot)
     await db.schedule.delete_many({
         "class_id": payload.class_id,
@@ -1591,8 +1831,56 @@ async def auto_schedule(request: Request):
     assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
     existing = await load_all_schedule()
     valid_slots_by_day = await get_valid_slots_by_day()
+    breaks_after = await get_breaks_after_map()
 
-    teacher_map = {t["id"]: t for t in teachers}
+    new_slots = _greedy_fill(assignments, {t["id"]: t for t in teachers}, existing, valid_slots_by_day,
+                             breaks_after)
+
+    if new_slots:
+        await db.schedule.insert_many(new_slots)
+    total = len(await load_all_schedule())
+    return {"ok": True, "added": len(new_slots), "total_slots": total}
+
+
+def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
+                 existing: List[dict], valid_slots_by_day: Dict[str, set],
+                 breaks_after: Optional[Dict[str, set]] = None) -> List[dict]:
+    """Isi kekurangan JP secara greedy dengan menghormati occupancy + availability.
+
+    Aturan blok: JP > 1 untuk (guru, mapel, kelas) yang sama WAJIB berurutan
+    dalam blok 2/3 JP pada hari yang sama (tidak menyeberangi istirahat).
+    Pembagian: 1->[1], 2->[2], 3->[3], 4->[2,2], 5->[3,2], 6->[3,3], 7->[3,2,2], dst.
+    Bila blok tak muat di mana pun (ketersediaan terfragmentasi), JP blok itu
+    dipasang satuan agar tidak ada jam yang hilang.
+
+    Dipakai oleh /schedule/auto dan /schedule/rebuild (logika identik).
+    """
+    breaks_after = breaks_after or {}
+
+    def split_blocks(n: int) -> List[int]:
+        blocks = []
+        while n > 4:
+            blocks.append(3)
+            n -= 3
+        if n == 4:
+            blocks.extend([2, 2])
+        elif n > 0:
+            blocks.append(n)
+        return blocks
+
+    def runs_of(slots_sorted: List[int], k: int, day: str) -> List[List[int]]:
+        """Semua run k slot bernomor urut tanpa menyeberangi break."""
+        brk = breaks_after.get(day, set())
+        out = []
+        for i in range(len(slots_sorted) - k + 1):
+            window = slots_sorted[i:i + k]
+            if any(window[j + 1] - window[j] != 1 for j in range(k - 1)):
+                continue
+            if any(p in brk for p in window[:-1]):
+                continue
+            out.append(window)
+        return out
+
     # occupancy trackers
     class_slots: Dict[tuple, bool] = {}  # (class_id, day, slot) -> occupied
     teacher_slots: Dict[tuple, bool] = {}  # (teacher_id, day, slot)
@@ -1615,6 +1903,30 @@ async def auto_schedule(request: Request):
 
     assignments_sorted = sorted(assignments, key=teacher_constraint_count, reverse=True)
 
+    def slot_free(a: dict, teacher: dict, day: str, slot: int,
+                  class_slots: dict, teacher_slots: dict) -> bool:
+        if class_slots.get((a["class_id"], day, slot)):
+            return False
+        if teacher_slots.get((a["teacher_id"], day, slot)):
+            return False
+        if teacher.get("availability", {}).get(f"{day}-{slot}", "available") == "unavailable":
+            return False
+        return True
+
+    def occupy(a: dict, day: str, slot: int, class_slots: dict, teacher_slots: dict,
+               new_slots: list, placed_box: List[int]) -> None:
+        new_slots.append({
+            "id": new_id("sch"),
+            "class_id": a["class_id"],
+            "day": day,
+            "slot": slot,
+            "subject_id": a["subject_id"],
+            "teacher_id": a["teacher_id"],
+        })
+        class_slots[(a["class_id"], day, slot)] = True
+        teacher_slots[(a["teacher_id"], day, slot)] = True
+        placed_box[0] += 1
+
     new_slots = []
     for a in assignments_sorted:
         teacher = teacher_map.get(a["teacher_id"])
@@ -1625,41 +1937,90 @@ async def auto_schedule(request: Request):
         )
         if needed <= 0:
             continue
-        placed = 0
-        # iterate day-slot in order
-        for day in DAYS:
-            valid = sorted(valid_slots_by_day.get(day, set()))
-            for slot in valid:
-                if placed >= needed:
-                    break
-                # constraint checks
-                if class_slots.get((a["class_id"], day, slot)):
-                    continue
-                if teacher_slots.get((a["teacher_id"], day, slot)):
-                    continue
-                avail = teacher.get("availability", {}).get(f"{day}-{slot}", "available")
-                if avail == "unavailable":
-                    continue
-                # OK, assign
-                new_slot = {
-                    "id": new_id("sch"),
-                    "class_id": a["class_id"],
-                    "day": day,
-                    "slot": slot,
-                    "subject_id": a["subject_id"],
-                    "teacher_id": a["teacher_id"],
-                }
-                new_slots.append(new_slot)
-                class_slots[(a["class_id"], day, slot)] = True
-                teacher_slots[(a["teacher_id"], day, slot)] = True
-                placed += 1
-            if placed >= needed:
-                break
+        placed_box = [0]
+        for k in split_blocks(needed):
+            done = False
+            if k > 1:
+                # cari run k slot berurutan di hari yang sama
+                for day in DAYS:
+                    valid = sorted(valid_slots_by_day.get(day, set()))
+                    for run in runs_of(valid, k, day):
+                        if all(slot_free(a, teacher, day, s, class_slots, teacher_slots) for s in run):
+                            for s in run:
+                                occupy(a, day, s, class_slots, teacher_slots, new_slots, placed_box)
+                            done = True
+                            break
+                    if done:
+                        break
+            if not done:
+                # fallback: pasang satuan (first-fit) agar JP tidak hilang
+                for _ in range(k):
+                    for day in DAYS:
+                        valid = sorted(valid_slots_by_day.get(day, set()))
+                        fitted = False
+                        for slot in valid:
+                            if slot_free(a, teacher, day, slot, class_slots, teacher_slots):
+                                occupy(a, day, slot, class_slots, teacher_slots, new_slots, placed_box)
+                                fitted = True
+                                break
+                        if fitted:
+                            break
+    return new_slots
 
+
+@api_router.post("/schedule/rebuild")
+async def rebuild_schedule(request: Request):
+    """Sinkron ulang jadwal terhadap availability & konfigurasi hari terkini.
+
+    1. Hapus slot yang melanggar: guru double-booked (simpan 1, hapus sisanya),
+       availability violation, dan invalid_slot.
+    2. Isi ulang kekurangan JP secara greedy (hormati availability terbaru).
+    """
+    await require_user(request)
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
+    assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
+    existing = await load_all_schedule()
+    valid_slots_by_day = await get_valid_slots_by_day()
+    teacher_map = {t["id"]: t for t in teachers}
+
+    to_delete: List[str] = []
+    removed_detail: List[dict] = []
+    seen_teacher: Dict[tuple, dict] = {}
+    for s in existing:
+        key_t = (s["teacher_id"], s["day"], s["slot"])
+        if key_t in seen_teacher:
+            to_delete.append(s["id"])
+            removed_detail.append({"id": s["id"], "reason": "teacher_double_booked",
+                                   "day": s["day"], "slot": s["slot"],
+                                   "teacher_id": s["teacher_id"], "class_id": s["class_id"]})
+            continue
+        seen_teacher[key_t] = s
+        t = teacher_map.get(s["teacher_id"])
+        reason = None
+        if t and t.get("availability", {}).get(f"{s['day']}-{s['slot']}") == "unavailable":
+            reason = "availability_violation"
+        elif s["slot"] not in valid_slots_by_day.get(s["day"], set()):
+            reason = "invalid_slot"
+        if reason:
+            to_delete.append(s["id"])
+            removed_detail.append({"id": s["id"], "reason": reason,
+                                   "day": s["day"], "slot": s["slot"],
+                                   "teacher_id": s["teacher_id"], "class_id": s["class_id"]})
+
+    if to_delete:
+        await db.schedule.delete_many({"id": {"$in": to_delete}})
+
+    remaining = [s for s in existing if s["id"] not in set(to_delete)]
+    breaks_after = await get_breaks_after_map()
+    new_slots = _greedy_fill(assignments, teacher_map, remaining, valid_slots_by_day, breaks_after)
     if new_slots:
         await db.schedule.insert_many(new_slots)
     total = len(await load_all_schedule())
-    return {"ok": True, "added": len(new_slots), "total_slots": total}
+    schedule = await load_all_schedule()
+    conflicts = detect_conflicts(schedule, teachers, valid_slots_by_day)
+    return {"ok": True, "removed": len(to_delete), "removed_detail": removed_detail,
+            "added": len(new_slots), "total_slots": total,
+            "conflicts_remaining": len(conflicts)}
 
 
 # ---------------- Dashboard ----------------
@@ -1702,6 +2063,69 @@ async def reset_all_data(request: Request):
         r = await db[coll].delete_many({})
         out[coll] = r.deleted_count
     return {"ok": True, "deleted": out}
+
+
+BACKUP_COLLECTIONS = ("teachers", "subjects", "classes", "assignments", "schedule", "day_configs")
+
+
+@api_router.get("/backup")
+async def download_backup(request: Request):
+    """Unduh backup JSON seluruh data + pengaturan (termasuk availability & day_configs).
+
+    Koleksi users/sessions TIDAK ikut (data auth sistem).
+    """
+    await require_user(request)
+    data = {}
+    for coll in BACKUP_COLLECTIONS:
+        data[coll] = await db[coll].find({}, {"_id": 0}).to_list(10000)
+    return {"ok": True, "app": "JadwalPro", "version": 1,
+            "exported_at": now_utc().isoformat(), "data": data}
+
+
+@api_router.post("/restore")
+async def restore_backup(request: Request, file: UploadFile = File(...)):
+    """Restore dari file backup JSON. Koleksi yang ada di file diganti seluruhnya.
+
+    Validasi ringan: tiap dokumen wajib punya field `id`. Item invalid dilewati
+    dan dilaporkan (maks 80).
+    """
+    await require_user(request)
+    fname = (file.filename or "").lower()
+    if not fname.endswith(".json"):
+        raise HTTPException(status_code=400, detail="File harus berformat .json (hasil Unduh Backup)")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="File kosong")
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="File JSON tidak valid / rusak")
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Format backup tidak dikenal (kunci 'data' hilang)")
+    known = [c for c in BACKUP_COLLECTIONS if c in data]
+    if not known:
+        raise HTTPException(status_code=400, detail="File backup tidak berisi koleksi yang dikenal")
+    result: Dict[str, Any] = {}
+    errors: List[dict] = []
+    for coll in known:
+        docs = data[coll]
+        if not isinstance(docs, list):
+            errors.append({"sheet": coll, "row": 0, "message": "Bukan list — koleksi dilewati"})
+            continue
+        clean = []
+        for i, d in enumerate(docs, start=1):
+            if not isinstance(d, dict) or not d.get("id"):
+                if len(errors) < 80:
+                    errors.append({"sheet": coll, "row": i, "message": "Dokumen tanpa field 'id' — dilewati"})
+                continue
+            d = {k: v for k, v in d.items() if k != "_id"}
+            clean.append(d)
+        await db[coll].delete_many({})
+        if clean:
+            await db[coll].insert_many(clean)
+        result[coll] = len(clean)
+    return {"ok": True, "restored": result, "errors": errors, "skipped": len(errors)}
 
 
 def build_availability(rules: List[dict]) -> Dict[str, str]:
@@ -1758,9 +2182,9 @@ async def seed_data(request: Request):
         teachers = [
             {
                 "id": new_id("t"),
+                "nomor": 1,
                 "name": "Drs. Dadang Ahmad Tajudin",
                 "email": "", "whatsapp": "",
-                "max_hours_per_week": 24,
                 "notes": "Tidak tersedia Sabtu-Ahad; hanya slot 08:30-10:30 (JP 3-4).",
                 "availability": build_availability([
                     {"days": ["Saturday"], "status": "unavailable"},
@@ -1773,9 +2197,9 @@ async def seed_data(request: Request):
             },
             {
                 "id": new_id("t"),
+                "nomor": 2,
                 "name": "Zaenal Mutaqin, S.Ag",
                 "email": "", "whatsapp": "",
-                "max_hours_per_week": 24,
                 "notes": "Sabtu full day; hari lain hanya setelah Dhuhr (JP 5+).",
                 "availability": build_availability([
                     # Other days: before Dhuhr unavailable
@@ -1785,9 +2209,9 @@ async def seed_data(request: Request):
             },
             {
                 "id": new_id("t"),
+                "nomor": 3,
                 "name": "Hasan Nasrulloh, S.Pd",
                 "email": "", "whatsapp": "",
-                "max_hours_per_week": 24,
                 "notes": "Tidak tersedia Rabu-Kamis, dan JP 1-2 pada hari lain.",
                 "availability": build_availability([
                     {"days": ["Wednesday", "Thursday"], "status": "unavailable"},
@@ -1796,9 +2220,9 @@ async def seed_data(request: Request):
             },
             {
                 "id": new_id("t"),
+                "nomor": 4,
                 "name": "Dinan Afifah Firdaus, S.Pd",
                 "email": "", "whatsapp": "",
-                "max_hours_per_week": 24,
                 "notes": "Selasa & Rabu dari 10:00 (JP 5+); Jumat setelah Sholat (JP 7+). Preferensi kelas XII.",
                 "availability": build_availability([
                     {"days": ["Tuesday", "Wednesday"], "slots": [1, 2, 3, 4], "status": "unavailable"},
@@ -1807,9 +2231,9 @@ async def seed_data(request: Request):
             },
             {
                 "id": new_id("t"),
+                "nomor": 5,
                 "name": "Nuzlia Fitriani Hapsari, S.Akun",
                 "email": "", "whatsapp": "",
-                "max_hours_per_week": 24,
                 "notes": "Senin & Kamis available; Jumat & Sabtu full; Selasa-Rabu unavailable setelah Dhuhr.",
                 "availability": build_availability([
                     {"days": ["Tuesday", "Wednesday"], "slots": AFTER_DHUHR, "status": "unavailable"},
@@ -1817,9 +2241,9 @@ async def seed_data(request: Request):
             },
             {
                 "id": new_id("t"),
+                "nomor": 6,
                 "name": "Fahmi Kurnia Hidayatulloh, S.Pd",
                 "email": "", "whatsapp": "",
-                "max_hours_per_week": 24,
                 "notes": "Senin JP 3+, Selasa JP 1, Rabu JP 1-2, Kamis JP 5+; Sabtu unavailable.",
                 "availability": build_availability([
                     {"days": ["Monday"], "slots": [1, 2], "status": "unavailable"},
@@ -1879,6 +2303,10 @@ async def update_subject(subject_id: str, payload: Subject, request: Request):
     await require_user(request)
     doc = payload.model_dump()
     doc["id"] = subject_id
+    if not doc.get("color"):
+        existing = await db.subjects.find_one({"id": subject_id}, {"_id": 0})
+        doc["color"] = (existing or {}).get("color") or auto_subject_color(
+            await db.subjects.count_documents({}))
     await db.subjects.update_one({"id": subject_id}, {"$set": doc}, upsert=True)
     return Subject(**doc)
 

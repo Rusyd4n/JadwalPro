@@ -14,16 +14,17 @@ function emptyAvailability() {
   const av = {};
   DAYS.forEach((d) => {
     const slots = d === "Friday" ? FRIDAY_ACTIVE_SLOTS : SLOTS;
-    slots.forEach((s) => { av[`${d}-${s}`] = "available"; });
+    slots.forEach((s) => { av[`${d}-${s}`] = "unavailable"; });
   });
   return av;
 }
 
 export default function Teachers() {
   const [teachers, setTeachers] = useState([]);
+  const [assignments, setAssignments] = useState([]);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
-  const [form, setForm] = useState({ name: "", email: "", whatsapp: "", max_hours_per_week: 24, notes: "" });
+  const [form, setForm] = useState({ nomor: "", name: "", email: "", whatsapp: "", notes: "" });
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef(null);
   const [selected, setSelected] = useState([]);
@@ -35,36 +36,43 @@ export default function Teachers() {
     setSelected((prev) => (prev.length === teachers.length && teachers.length > 0 ? [] : teachers.map((t) => t.id)));
 
   const load = async () => {
-    const r = await api.get("/teachers");
-    setTeachers(r.data);
+    const [t, a] = await Promise.all([api.get("/teachers"), api.get("/assignments")]);
+    const sorted = [...t.data].sort((x, y) => (x.nomor ?? 9999) - (y.nomor ?? 9999));
+    setTeachers(sorted);
+    setAssignments(a.data);
     setSelected([]);
   };
   useEffect(() => { load(); }, []);
 
+  const bebanOf = (teacherId) => assignments.filter((a) => a.teacher_id === teacherId)
+    .reduce((s, a) => s + (a.hours_per_week || 0), 0);
+
   const openNew = () => {
     setEditing(null);
-    setForm({ name: "", email: "", whatsapp: "", max_hours_per_week: 24, notes: "" });
+    setForm({ nomor: "", name: "", email: "", whatsapp: "", notes: "" });
     setOpen(true);
   };
   const openEdit = (t) => {
     setEditing(t);
-    setForm({ name: t.name, email: t.email || "", whatsapp: t.whatsapp || "", max_hours_per_week: t.max_hours_per_week, notes: t.notes || "" });
+    setForm({ nomor: t.nomor ?? "", name: t.name, email: t.email || "", whatsapp: t.whatsapp || "", notes: t.notes || "" });
     setOpen(true);
   };
   const save = async () => {
     if (!form.name.trim()) { toast.error("Nama wajib diisi"); return; }
+    const nomor = form.nomor === "" ? null : parseInt(form.nomor, 10);
+    if (form.nomor !== "" && (!Number.isInteger(nomor) || nomor < 1)) { toast.error("Nomor harus bilangan bulat ≥ 1"); return; }
     try {
       if (editing) {
-        await api.put(`/teachers/${editing.id}`, { ...editing, ...form });
+        await api.put(`/teachers/${editing.id}`, { ...editing, ...form, nomor });
         toast.success("Guru diperbarui");
       } else {
-        await api.post("/teachers", { ...form, availability: emptyAvailability() });
+        await api.post("/teachers", { ...form, nomor, availability: emptyAvailability() });
         toast.success("Guru ditambahkan");
       }
       setOpen(false);
       load();
     } catch (e) {
-      toast.error("Gagal menyimpan");
+      toast.error(e.response?.data?.detail || "Gagal menyimpan");
     }
   };
   const remove = async (id) => {
@@ -100,7 +108,7 @@ export default function Teachers() {
       a.click();
       a.remove();
       window.URL.revokeObjectURL(url);
-      toast.success("Template diunduh. Isi kolom nama, email, whatsapp, max_jp_per_minggu, catatan.");
+      toast.success("Template diunduh. Isi kolom nomor, nama, email, whatsapp, catatan.");
     } catch (e) {
       toast.error("Gagal mengunduh template");
     }
@@ -142,7 +150,7 @@ export default function Teachers() {
       <div className="flex items-start justify-between mb-6">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Data Guru</h1>
-          <p className="text-sm text-slate-500 mt-1">Kelola daftar guru, kontak, dan beban maksimal per minggu</p>
+          <p className="text-sm text-slate-500 mt-1">Kelola daftar guru — nomor = primary key (kode guru di jadwal). Beban JP dihitung otomatis dari Teaching Load.</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap justify-end">
           <input
@@ -176,9 +184,15 @@ export default function Teachers() {
               <DialogTitle>{editing ? "Edit Guru" : "Tambah Guru Baru"}</DialogTitle>
             </DialogHeader>
             <div className="space-y-4 py-2">
-              <div>
-                <Label>Nama Lengkap</Label>
-                <Input data-testid="teacher-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Drs. ..." />
+              <div className="grid grid-cols-3 gap-3">
+                <div>
+                  <Label>Nomor (PK)</Label>
+                  <Input data-testid="teacher-nomor-input" type="number" min={1} value={form.nomor} onChange={(e) => setForm({ ...form, nomor: e.target.value })} placeholder="Otomatis" />
+                </div>
+                <div className="col-span-2">
+                  <Label>Nama Lengkap</Label>
+                  <Input data-testid="teacher-name-input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Drs. ..." />
+                </div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
@@ -189,10 +203,6 @@ export default function Teachers() {
                   <Label>WhatsApp</Label>
                   <Input value={form.whatsapp} onChange={(e) => setForm({ ...form, whatsapp: e.target.value })} placeholder="0812..." />
                 </div>
-              </div>
-              <div>
-                <Label>Maks. JP/minggu</Label>
-                <Input type="number" value={form.max_hours_per_week} onChange={(e) => setForm({ ...form, max_hours_per_week: parseInt(e.target.value || "0", 10) })} />
               </div>
               <div>
                 <Label>Catatan</Label>
@@ -236,16 +246,17 @@ export default function Teachers() {
                   onCheckedChange={toggleAll}
                 />
               </th>
+              <th className="p-3 w-16">Nomor</th>
               <th className="p-3">Nama</th>
               <th className="p-3">Kontak</th>
-              <th className="p-3">Maks JP</th>
+              <th className="p-3">Beban JP</th>
               <th className="p-3">Catatan</th>
               <th className="p-3 w-32"></th>
             </tr>
           </thead>
           <tbody>
             {teachers.length === 0 && (
-              <tr><td colSpan={6} className="p-6 text-center text-slate-400">Belum ada guru. Klik "Muat Data Awal" di dashboard.</td></tr>
+              <tr><td colSpan={7} className="p-6 text-center text-slate-400">Belum ada guru. Klik "Muat Data Awal" di dashboard.</td></tr>
             )}
             {teachers.map((t) => (
               <tr key={t.id} data-testid={`teacher-row-${t.id}`} className={`border-b border-slate-100 hover:bg-slate-50 transition-colors duration-150 ${selected.includes(t.id) ? "bg-red-50/50" : ""}`}>
@@ -256,6 +267,7 @@ export default function Teachers() {
                     onCheckedChange={() => toggleOne(t.id)}
                   />
                 </td>
+                <td className="p-3 w-16 font-mono font-semibold text-emerald-700">{t.nomor ?? "—"}</td>
                 <td className="p-3">
                   <div className="flex items-center gap-2">
                     <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center"><UserRound size={14} /></div>
@@ -267,7 +279,7 @@ export default function Teachers() {
                   {t.whatsapp && <div>{t.whatsapp}</div>}
                   {!t.email && !t.whatsapp && <span className="text-slate-400">—</span>}
                 </td>
-                <td className="p-3 font-mono text-slate-700">{t.max_hours_per_week}</td>
+                <td className="p-3 font-mono text-slate-700">{bebanOf(t.id)} JP</td>
                 <td className="p-3 text-slate-600 text-xs max-w-md">{t.notes || <span className="text-slate-400">—</span>}</td>
                 <td className="p-3 text-right">
                   <button data-testid={`edit-teacher-${t.id}`} onClick={() => openEdit(t)} className="p-1.5 hover:bg-slate-100 rounded transition-colors duration-150"><Edit3 size={14} /></button>

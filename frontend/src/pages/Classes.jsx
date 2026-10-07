@@ -11,9 +11,10 @@ import { toast } from "sonner";
 
 export default function Classes() {
   const [items, setItems] = useState([]);
+  const [teachers, setTeachers] = useState([]);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
-  const [form, setForm] = useState({ name: "", grade: "X" });
+  const [form, setForm] = useState({ name: "", grade: "X", wali_kelas_id: "" });
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef(null);
   const [selected, setSelected] = useState([]);
@@ -25,14 +26,20 @@ export default function Classes() {
     setSelected((prev) => (prev.length === items.length && items.length > 0 ? [] : items.map((c) => c.id)));
 
   const load = async () => {
-    const r = await api.get("/classes");
-    setItems(r.data);
+    const [c, t] = await Promise.all([api.get("/classes"), api.get("/teachers")]);
+    setItems(c.data);
+    setTeachers([...t.data].sort((a, b) => (a.nomor ?? 9999) - (b.nomor ?? 9999)));
     setSelected([]);
   };
   useEffect(() => { load(); }, []);
 
-  const openNew = () => { setEditing(null); setForm({ name: "", grade: "X" }); setOpen(true); };
-  const openEdit = (c) => { setEditing(c); setForm({ name: c.name, grade: c.grade }); setOpen(true); };
+  const teacherLabel = (id) => {
+    const t = teachers.find((x) => x.id === id);
+    return t ? `${t.nomor ? `${t.nomor}. ` : ""}${t.name}` : "—";
+  };
+
+  const openNew = () => { setEditing(null); setForm({ name: "", grade: "X", wali_kelas_id: "" }); setOpen(true); };
+  const openEdit = (c) => { setEditing(c); setForm({ name: c.name, grade: c.grade, wali_kelas_id: c.wali_kelas_id || "" }); setOpen(true); };
 
   const save = async () => {
     if (!form.name.trim()) { toast.error("Nama wajib diisi"); return; }
@@ -82,7 +89,7 @@ export default function Classes() {
       a.click();
       a.remove();
       window.URL.revokeObjectURL(url);
-      toast.success("Template diunduh. Isi kolom nama, tingkat (X/XI/XII).");
+      toast.success("Template diunduh. Isi kolom nama, tingkat (X/XI/XII), wali_kelas (nomor/nama guru).");
     } catch (e) {
       toast.error("Gagal mengunduh template");
     }
@@ -184,6 +191,16 @@ export default function Classes() {
                   </SelectContent>
                 </Select>
               </div>
+              <div>
+                <Label>Wali Kelas</Label>
+                <Select value={form.wali_kelas_id || "__none__"} onValueChange={(v) => setForm({ ...form, wali_kelas_id: v === "__none__" ? "" : v })}>
+                  <SelectTrigger data-testid="class-wali-select" className="bg-white"><SelectValue placeholder="Pilih wali kelas..." /></SelectTrigger>
+                  <SelectContent className="bg-white">
+                    <SelectItem value="__none__">— Tanpa wali kelas —</SelectItem>
+                    {teachers.map((t) => <SelectItem key={t.id} value={t.id}>{t.nomor ? `${t.nomor}. ` : ""}{t.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
             <DialogFooter>
               <Button variant="outline" onClick={() => setOpen(false)}>Batal</Button>
@@ -252,6 +269,9 @@ export default function Classes() {
                     <div className="flex-1 min-w-0">
                       <div className="font-semibold text-slate-900 truncate">{c.name}</div>
                       <div className="text-xs text-slate-500 mt-0.5">Tingkat {c.grade}</div>
+                      <div className="text-[11px] text-slate-500 mt-0.5 truncate" title={teacherLabel(c.wali_kelas_id)}>
+                        Wali: {c.wali_kelas_id ? teacherLabel(c.wali_kelas_id) : <span className="text-slate-400">—</span>}
+                      </div>
                     </div>
                     <div className="flex items-start gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                       <button

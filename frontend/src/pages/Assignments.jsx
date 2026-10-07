@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import api from "@/lib/api";
-import { Plus, Trash2, ClipboardList, Download, Upload, FileUp, FileSpreadsheet } from "lucide-react";
+import { Plus, Trash2, ClipboardList, Download, Upload, FileUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -17,9 +17,6 @@ export default function Assignments() {
   const [form, setForm] = useState({ teacher_id: "", subject_id: "", class_id: "", hours_per_week: 2 });
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef(null);
-  const [wbUploading, setWbUploading] = useState(false);
-  const wbFileRef = useRef(null);
-  const [wbResult, setWbResult] = useState(null);
   const [selected, setSelected] = useState([]);
   const [bulkDeleting, setBulkDeleting] = useState(false);
 
@@ -84,59 +81,6 @@ export default function Assignments() {
       toast.success("Template diunduh. Isi kolom nama_guru, mata_pelajaran, kelas, jp_per_minggu.");
     } catch (e) {
       toast.error("Gagal mengunduh template");
-    }
-  };
-
-  const downloadUnifiedTemplate = async () => {
-    try {
-      const res = await api.get("/import/template.xlsx", { responseType: "blob" });
-      const url = window.URL.createObjectURL(new Blob([res.data], {
-        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      }));
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "template_import_jadwal.xlsx";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      window.URL.revokeObjectURL(url);
-      toast.success("Template terpadu diunduh (Guru + Mapel + Kelas + Penugasan_Matrix).");
-    } catch (e) {
-      toast.error("Gagal mengunduh template terpadu");
-    }
-  };
-
-  const handleWorkbookUpload = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!/\.xlsx?m?$/.test(file.name.toLowerCase())) {
-      toast.error("File harus berformat .xlsx (gunakan Template Terpadu)");
-      e.target.value = "";
-      return;
-    }
-    setWbUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append("file", file);
-      const res = await api.post("/import/workbook", fd, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      setWbResult(res.data);
-      const s = res.data?.summary;
-      const total = ["guru", "mapel", "kelas", "penugasan"].reduce(
-        (n, k) => n + (s?.[k]?.added || 0) + (s?.[k]?.updated || 0), 0
-      );
-      if ((res.data?.errors || []).length > 0) {
-        toast.warning(`Impor selesai dengan ${(res.data.errors || []).length} baris bermasalah. Lihat rincian.`, { duration: 6000 });
-      } else {
-        toast.success(`Impor terpadu berhasil: ${total} data diproses`);
-      }
-      load();
-    } catch (err) {
-      toast.error(err.response?.data?.detail || "Gagal mengunggah workbook");
-    } finally {
-      setWbUploading(false);
-      e.target.value = "";
     }
   };
 
@@ -214,7 +158,7 @@ export default function Assignments() {
                 <Label>Guru</Label>
                 <Select value={form.teacher_id} onValueChange={(v) => setForm({ ...form, teacher_id: v })}>
                   <SelectTrigger data-testid="assign-teacher-select" className="bg-white"><SelectValue placeholder="Pilih guru..." /></SelectTrigger>
-                  <SelectContent className="bg-white">{teachers.map((t) => <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>)}</SelectContent>
+                  <SelectContent className="bg-white">{teachers.map((t) => <SelectItem key={t.id} value={t.id}>{t.nomor ? `${t.nomor}. ` : ""}{t.name}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div>
@@ -244,79 +188,6 @@ export default function Assignments() {
           </Dialog>
         </div>
       </div>
-
-      <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-4 mb-4 flex flex-wrap items-center gap-3">
-        <div className="w-10 h-10 rounded-md bg-emerald-600 text-white flex items-center justify-center shrink-0">
-          <FileSpreadsheet size={18} />
-        </div>
-        <div className="flex-1 min-w-[220px]">
-          <div className="font-semibold text-emerald-900">Impor Terpadu — 1 file untuk semua</div>
-          <div className="text-xs text-emerald-800 mt-0.5">
-            Unduh template .xlsx (Guru + Mapel + Kelas + Penugasan_Matrix format pivot), isi sekaligus, lalu unggah sekali. Guru/mapel/kelas baru dibuat otomatis.
-          </div>
-        </div>
-        <input
-          ref={wbFileRef}
-          type="file"
-          accept=".xlsx,.xlsm"
-          className="hidden"
-          data-testid="upload-workbook-input"
-          onChange={handleWorkbookUpload}
-        />
-        <Button data-testid="download-workbook-template-btn" variant="outline" className="bg-white" onClick={downloadUnifiedTemplate}>
-          <Download size={16} className="mr-2" /> Template Terpadu (.xlsx)
-        </Button>
-        <Button
-          data-testid="upload-workbook-btn"
-          className="bg-emerald-600 hover:bg-emerald-700 text-white"
-          disabled={wbUploading}
-          onClick={() => wbFileRef.current?.click()}
-        >
-          {wbUploading ? <FileUp size={16} className="mr-2 animate-pulse" /> : <Upload size={16} className="mr-2" />}
-          {wbUploading ? "Mengunggah..." : "Unggah Terpadu (.xlsx)"}
-        </Button>
-      </div>
-
-      <Dialog open={!!wbResult} onOpenChange={(v) => { if (!v) setWbResult(null); }}>
-        <DialogContent className="bg-white max-w-lg">
-          <DialogHeader>
-            <DialogTitle>Hasil Impor Terpadu</DialogTitle>
-          </DialogHeader>
-          {wbResult && (
-            <div className="space-y-3 py-2 text-sm">
-              <div className="grid grid-cols-2 gap-2">
-                {["guru", "mapel", "kelas", "penugasan"].map((k) => (
-                  <div key={k} className="border border-slate-200 rounded-md p-2.5">
-                    <div className="text-xs uppercase tracking-wide text-slate-500 font-semibold">{k}</div>
-                    <div className="mt-1 font-mono text-slate-800">
-                      +{wbResult.summary?.[k]?.added || 0} baru · ~{wbResult.summary?.[k]?.updated || 0} diperbarui
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {(wbResult.errors || []).length > 0 ? (
-                <div>
-                  <div className="text-xs font-semibold text-amber-700 mb-1">
-                    {wbResult.errors.length} baris bermasalah (menampilkan 10 pertama):
-                  </div>
-                  <ul className="max-h-48 overflow-y-auto text-xs space-y-1 bg-amber-50 border border-amber-200 rounded-md p-2">
-                    {wbResult.errors.slice(0, 10).map((er, i) => (
-                      <li key={i} className="text-amber-900">
-                        <span className="font-mono">{er.sheet} #{er.row}:</span> {er.message}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              ) : (
-                <div className="text-emerald-700 text-xs">Semua baris berhasil diproses tanpa error.</div>
-              )}
-            </div>
-          )}
-          <DialogFooter>
-            <Button onClick={() => setWbResult(null)} className="bg-emerald-600 hover:bg-emerald-700 text-white">Tutup</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       <div className="bg-white border border-slate-200 rounded-lg overflow-hidden">
         {selected.length > 0 && (
