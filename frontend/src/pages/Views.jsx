@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import api from "@/lib/api";
+import { conflictSnippet } from "@/lib/conflicts";
 import { DAYS, DAY_ID } from "@/lib/constants";
 import {
   useConfig, maxPeriodCount, isSlotValid, getSlotTiming, getBreakRow,
@@ -9,24 +10,31 @@ import { Printer, Download } from "lucide-react";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 
+// Layout master: 2 band vertikal x 3 hari (V-scroll), tiap band 10 JP
+const DAY_BANDS = [["Monday", "Tuesday", "Wednesday"], ["Thursday", "Friday", "Saturday"]];
+
 export default function Views() {
   const { configs } = useConfig();
   const [teachers, setTeachers] = useState([]);
   const [subjects, setSubjects] = useState([]);
   const [classes, setClasses] = useState([]);
   const [schedule, setSchedule] = useState([]);
+  const [conflicts, setConflicts] = useState([]);
 
   useEffect(() => {
     (async () => {
-      const [t, s, c, sch] = await Promise.all([
+      const [t, s, c, sch, cf] = await Promise.all([
         api.get("/teachers"), api.get("/subjects"), api.get("/classes"), api.get("/schedule"),
+        api.get("/schedule/conflicts"),
       ]);
       setTeachers(t.data); setSubjects(s.data); setClasses(c.data); setSchedule(sch.data);
+      setConflicts(cf.data || []);
     })();
   }, []);
 
   const teacherMap = useMemo(() => Object.fromEntries(teachers.map((t) => [t.id, t])), [teachers]);
   const subjectMap = useMemo(() => Object.fromEntries(subjects.map((s) => [s.id, s])), [subjects]);
+  const classMap = useMemo(() => Object.fromEntries(classes.map((c) => [c.id, c])), [classes]);
   const maxSlots = useMemo(() => maxPeriodCount(configs), [configs]);
   const rows = useMemo(() => Array.from({ length: maxSlots }, (_, i) => i + 1), [maxSlots]);
 
@@ -79,14 +87,19 @@ export default function Views() {
       return <div className="text-center text-slate-400 py-12 text-sm">Belum ada data kelas.</div>;
     }
     return (
-      <div className="bg-white border border-slate-200 rounded-lg matrix-scroll">
+      <>
+      {DAY_BANDS.map((bandDays, bi) => (
+      <div key={bi} className="bg-white border border-slate-200 rounded-lg matrix-scroll mb-4">
+        <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500 border-b border-slate-100">
+          {bandDays.map((d) => DAY_ID[d]).join(" · ")}
+        </div>
         <table className="w-full text-sm border-collapse">
           <thead className="bg-slate-50 border-b border-slate-200 sticky top-0 z-10">
             <tr>
               <th rowSpan={2} className="p-2 text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-20 w-20 border-r border-slate-200">
                 Jam
               </th>
-              {DAYS.map((d) => (
+              {bandDays.map((d) => (
                 <th
                   key={d}
                   colSpan={sortedClasses.length}
@@ -97,7 +110,7 @@ export default function Views() {
               ))}
             </tr>
             <tr>
-              {DAYS.map((d) => (
+              {bandDays.map((d) => (
                 <Fragment key={d}>
                   {sortedClasses.map((c) => (
                     <th
@@ -124,10 +137,10 @@ export default function Views() {
                         {getSlotTiming(configs, DAYS[0], slot)?.start_str || ""}
                       </div>
                     </td>
-                    {DAYS.map((day) => (
+                    {bandDays.map((day) => (
                       <Fragment key={day}>
                         {sortedClasses.map((c) => {
-                          if (!isSlotValid(configs, day, slot)) {
+                          if (!isSlotValid(configs, day, slot, c.id)) {
                             return (
                               <td key={c.id} className="p-0.5 border-l border-slate-50">
                                 <div className="bg-slate-100/70 text-slate-300 text-center py-2 text-[11px]">—</div>
@@ -144,16 +157,20 @@ export default function Views() {
                           }
                           const subject = subjectMap[entry.subject_id];
                           const color = subject?.color || "#059669";
+                          const conflict = conflicts.find(
+                            (cf) => cf.day === day && cf.slot === slot &&
+                              ((cf.class_ids && cf.class_ids.includes(c.id)) || cf.class_id === c.id)
+                          );
                           return (
                             <td
                               key={c.id}
                               data-testid={`master-cell-${day}-${slot}-${c.id}`}
-                              title={`${teacherMap[entry.teacher_id]?.name || "?"} — ${subject?.name || "?"} (${c.name})`}
+                              title={`${teacherMap[entry.teacher_id]?.name || "?"} — ${subject?.name || "?"} (${c.name})${conflict ? `\n⚠ ${conflictSnippet(conflict, teacherMap, classMap)}` : ""}`}
                               className="p-0.5 border-l border-slate-50"
                             >
                               <div
-                                className="text-center py-1.5 px-1 rounded text-xs font-mono font-semibold"
-                                style={{ background: color + "26", color: "#0f172a", borderLeft: `3px solid ${color}` }}
+                                className={`text-center py-1.5 px-1 rounded text-xs font-mono font-semibold ${conflict ? "cell-conflict" : ""}`}
+                                style={conflict ? { borderLeft: `3px solid ${color}` } : { background: color + "26", color: "#0f172a", borderLeft: `3px solid ${color}` }}
                               >
                                 {codeFor(entry)}
                               </div>
@@ -168,7 +185,7 @@ export default function Views() {
                       <td className="p-1 sticky left-0 bg-amber-50 border-r border-slate-200 text-[10px] text-amber-800 uppercase tracking-wide text-center z-10">
                         Break
                       </td>
-                      {DAYS.map((day) => {
+                      {bandDays.map((day) => {
                         const breaks = breakRow[day] || [];
                         return (
                           <td key={day} colSpan={sortedClasses.length} className="p-1 border-l border-slate-200">
@@ -186,6 +203,8 @@ export default function Views() {
           </tbody>
         </table>
       </div>
+      ))}
+      </>
     );
   };
 
@@ -247,7 +266,7 @@ export default function Views() {
         const row = [`JP ${slot}`];
         DAYS.forEach((day) => {
           sortedClasses.forEach((c) => {
-            if (!isSlotValid(configs, day, slot)) { row.push("—"); return; }
+            if (!isSlotValid(configs, day, slot, c.id)) { row.push("—"); return; }
             const entry = scheduleLookup[`${day}|${slot}|${c.id}`];
             row.push(entry ? codeFor(entry) : "");
           });

@@ -1,13 +1,14 @@
 import { Fragment, useEffect, useState, useMemo } from "react";
 import api from "@/lib/api";
 import { DAYS, DAY_ID } from "@/lib/constants";
+import { conflictSnippet } from "@/lib/conflicts";
 import {
   useConfig, maxPeriodCount, isSlotValid, getSlotTiming, getBreakRow,
 } from "@/lib/scheduleConfig";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Sparkles, Trash2, AlertTriangle, X, GripVertical, Info, RefreshCw, PanelLeftClose, PanelLeftOpen, LayoutGrid, Square, Plus } from "lucide-react";
+import { Sparkles, Trash2, AlertTriangle, X, GripVertical, Info, RefreshCw, PanelLeftClose, PanelLeftOpen, LayoutGrid, Square, Plus, Bot } from "lucide-react";
 import { toast } from "sonner";
 import {
   DndContext, useDraggable, useDroppable, DragOverlay,
@@ -53,7 +54,7 @@ function DraggablePoolCard({ assignment, subject, teacher, classLabel }) {
   );
 }
 
-function DraggableFilledCell({ cell, subject, teacher, conflict, onClear }) {
+function DraggableFilledCell({ cell, subject, teacher, conflict, hint, onClear }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
     id: `slot::${cell.id}`,
     data: { type: "slot", cell },
@@ -64,6 +65,7 @@ function DraggableFilledCell({ cell, subject, teacher, conflict, onClear }) {
       {...attributes}
       {...listeners}
       data-testid={`schedule-cell-${cell.day}-${cell.slot}`}
+      title={hint || undefined}
       className={`relative rounded p-2 text-xs group cursor-grab active:cursor-grabbing transition-colors duration-150 ${
         conflict ? "cell-conflict" : ""
       } ${isDragging ? "opacity-30" : ""}`}
@@ -106,11 +108,15 @@ function MasterScheduleCell({ cell, code, color, title, conflict, dimmed, onClea
       data-testid={`master-cell-${cell.day}-${cell.slot}-${cell.class_id}`}
       title={title}
       className={`relative rounded text-center py-1.5 px-1 text-xs font-mono font-semibold group cursor-grab active:cursor-grabbing transition-colors duration-150 ${
-        conflict ? "cell-conflict" : ""
-      } ${isDragging ? "opacity-30" : ""} ${dimmed ? "bg-white border border-slate-200 text-slate-400" : ""}`}
+        isDragging ? "opacity-30" : ""
+      } ${dimmed && !conflict ? "bg-white border border-slate-200 text-slate-400" : ""}`}
       style={
         conflict
-          ? { borderLeft: `3px solid ${color}` }
+          ? {
+              background: "rgba(239, 68, 68, 0.5)",
+              border: "2px solid #B91C1C",
+              color: "#7F1D1D",
+            }
           : dimmed
             ? undefined
             : { background: color + "26", borderLeft: `3px solid ${color}` }
@@ -159,6 +165,7 @@ export default function ScheduleBuilder() {
   const [selectedClassId, setSelectedClassId] = useState("");
   const [autoLoading, setAutoLoading] = useState(false);
   const [rebuildLoading, setRebuildLoading] = useState(false);
+  const [optimizeLoading, setOptimizeLoading] = useState(false);
   const [activeDrag, setActiveDrag] = useState(null);
   const [mode, setMode] = useState("class");
   const [panelOpen, setPanelOpen] = useState(true);
@@ -231,6 +238,8 @@ export default function ScheduleBuilder() {
       (a, b) => (order[a.grade] ?? 9) - (order[b.grade] ?? 9) || a.name.localeCompare(b.name, "id")
     );
   }, [classes]);
+  // Layout master: 2 band vertikal x 3 hari (V-scroll), tiap band 10 JP
+  const dayBands = useMemo(() => [DAYS.slice(0, 3), DAYS.slice(3, 6)], []);
   const teacherNo = useMemo(
     () => Object.fromEntries(teachers.map((t) => [t.id, t.nomor ?? "?"])),
     [teachers]
@@ -293,7 +302,7 @@ export default function ScheduleBuilder() {
     if (!overData || overData.type !== "cell") return;
     const { day, slot } = overData;
     const targetClassId = overData.classId || selectedClassId;
-    if (!isSlotValid(configs, day, slot)) {
+    if (!isSlotValid(configs, day, slot, targetClassId)) {
       toast.error(`Slot tidak tersedia pada ${DAY_ID[day]} JP ${slot}`);
       return;
     }
@@ -371,6 +380,26 @@ export default function ScheduleBuilder() {
     }
   };
 
+  const optimize = async () => {
+    if (!window.confirm("Regenerasi SELURUH jadwal dengan AI optimizer (CP-SAT)? Jadwal manual saat ini akan diganti. Semua JP dijamin terpasang dengan pelanggaran minimal.")) return;
+    setOptimizeLoading(true);
+    try {
+      const r = await api.post("/schedule/optimize?time_limit=120", {});
+      const d = r.data;
+      if (d.conflicts_remaining === 0) {
+        toast.success(`Optimizer selesai dalam ${d.wall_time}s: ${d.placed} slot, NOL konflik, NOL sisa (${d.solver_status})`);
+      } else {
+        toast.warning(`Optimizer selesai: ${d.placed} slot terpasang, sisa ${d.conflicts_remaining} konflik (terbukti minimal). Lihat sel merah.`, { duration: 8000 });
+      }
+      loadAll();
+    } catch (e) {
+      const detail = e.response?.data?.detail;
+      toast.error(detail?.message || detail || "Optimizer gagal");
+    } finally {
+      setOptimizeLoading(false);
+    }
+  };
+
   const totalConflictsForClass = conflicts.filter(
     (c) => (c.class_ids && c.class_ids.includes(selectedClassId)) || c.class_id === selectedClassId
   ).length;
@@ -391,6 +420,16 @@ export default function ScheduleBuilder() {
       onDragCancel={() => setActiveDrag(null)}
     >
       <div className="p-8">
+        <div className="sticky top-3 z-30 h-0 pointer-events-none">
+          <button
+            data-testid="floating-panel-toggle-btn"
+            onClick={() => setPanelOpen((v) => !v)}
+            title={panelOpen ? "Sembunyikan panel Belum Terjadwal" : "Tampilkan panel Belum Terjadwal"}
+            className="pointer-events-auto p-2 rounded-md bg-slate-900 text-slate-200 shadow-lg hover:text-white hover:bg-slate-800 transition-colors duration-150"
+          >
+            {panelOpen ? <PanelLeftClose size={16} /> : <PanelLeftOpen size={16} />}
+          </button>
+        </div>
         <div className="flex items-start justify-between mb-6 flex-wrap gap-3">
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Schedule Builder</h1>
@@ -440,6 +479,10 @@ export default function ScheduleBuilder() {
             <Button data-testid="rebuild-schedule-btn" onClick={rebuild} disabled={rebuildLoading} variant="outline" className="border-sky-200 text-sky-700 hover:bg-sky-50" title="Hapus slot yang melanggar availability terbaru, lalu isi ulang otomatis">
               <RefreshCw size={14} className="mr-2" />
               {rebuildLoading ? "Membangun..." : "Rebuild"}
+            </Button>
+            <Button data-testid="optimize-schedule-btn" onClick={optimize} disabled={optimizeLoading || autoLoading || rebuildLoading} className="bg-violet-600 hover:bg-violet-700 text-white" title="Regenerasi seluruh jadwal dengan AI optimizer: semua JP terpasang, konflik minimal terbukti optimal">
+              <Bot size={14} className="mr-2" />
+              {optimizeLoading ? "Mengoptimalkan..." : "AI Optimizer"}
             </Button>
             <Button data-testid="clear-schedule-btn" onClick={clearAll} variant="outline" className="border-red-200 text-red-600 hover:bg-red-50">
               <Trash2 size={14} className="mr-2" /> Bersihkan
@@ -520,7 +563,7 @@ export default function ScheduleBuilder() {
                           JP {slot}
                         </td>
                         {DAYS.map((day) => {
-                          const valid = isSlotValid(configs, day, slot);
+                          const valid = isSlotValid(configs, day, slot, selectedClassId);
                           if (!valid) {
                             return (
                               <td key={day} className="p-1">
@@ -539,6 +582,7 @@ export default function ScheduleBuilder() {
                                     subject={subjectMap[cell.subject_id]}
                                     teacher={teacherMap[cell.teacher_id]}
                                     conflict={conflict}
+                                    hint={conflict ? conflictSnippet(conflict, teacherMap, classMap) : `${teacherMap[cell.teacher_id]?.name || "?"} — ${subjectMap[cell.subject_id]?.name || "?"}`}
                                     onClear={() => clearSlot(cell.id)}
                                   />
                                 ) : (
@@ -581,6 +625,7 @@ export default function ScheduleBuilder() {
             </table>
           </div>
           ) : (
+          <div className="min-w-0">
           <div className="bg-white border border-slate-200 rounded-lg matrix-scroll">
             <div className="px-3 py-2 text-[11px] text-slate-500 border-b border-slate-100">
               Mode Master — sel menampilkan kode <span className="font-mono font-semibold">noGuru/kodeMapel</span> (arahkan kursor untuk detail). Seret kartu ke kolom kelas tujuan.
@@ -630,21 +675,27 @@ export default function ScheduleBuilder() {
                 )}
               </div>
             </div>
+          </div>
+          {dayBands.map((bandDays, bi) => (
+          <div key={bi} className="bg-white border border-slate-200 rounded-lg matrix-scroll mb-4">
+            <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500 border-b border-slate-100">
+              {bandDays.map((d) => DAY_ID[d]).join(" · ")}
+            </div>
             <table className="w-full text-sm border-collapse">
               <thead className="bg-slate-50 border-b border-slate-200 sticky top-0 z-10">
                 <tr>
-                  <th className="p-2 text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-20 w-16 border-r border-slate-200">JP</th>
-                  {DAYS.map((d) => (
+                  <th rowSpan={2} className="p-2 text-xs uppercase tracking-wide text-slate-500 sticky left-0 bg-slate-50 z-20 w-16 border-r border-slate-200">JP</th>
+                  {bandDays.map((d) => (
                     <th key={d} colSpan={sortedClasses.length} className="p-2 text-xs uppercase tracking-wide text-slate-700 border-l border-slate-200 bg-slate-100">
                       {DAY_ID[d]}
                     </th>
                   ))}
                 </tr>
                 <tr>
-                  {DAYS.map((d) => (
+                  {bandDays.map((d) => (
                     <Fragment key={d}>
                       {sortedClasses.map((c) => (
-                        <th key={`${d}-${c.id}`} className="p-1 text-[10px] font-mono text-slate-500 border-l border-slate-100 min-w-[60px]">
+                        <th key={`${d}-${c.id}`} className="p-1 text-[10px] font-mono text-slate-500 border-l border-slate-100 min-w-[52px]">
                           {c.name}
                         </th>
                       ))}
@@ -661,10 +712,10 @@ export default function ScheduleBuilder() {
                         <td className="p-1.5 sticky left-0 bg-white border-r border-slate-200 z-10 text-center font-semibold text-slate-800 text-xs">
                           {slot}
                         </td>
-                        {DAYS.map((day) => (
+                        {bandDays.map((day) => (
                           <Fragment key={day}>
                             {sortedClasses.map((c) => {
-                              if (!isSlotValid(configs, day, slot)) {
+                              if (!isSlotValid(configs, day, slot, c.id)) {
                                 return (
                                   <td key={c.id} className="p-0.5 border-l border-slate-50">
                                     <div className="bg-slate-100/70 text-slate-300 text-center py-1.5 text-[11px]">—</div>
@@ -681,7 +732,7 @@ export default function ScheduleBuilder() {
                                         cell={entry}
                                         code={codeFor(entry)}
                                         color={subjectMap[entry.subject_id]?.color || "#059669"}
-                                        title={`${teacherMap[entry.teacher_id]?.name || "?"} — ${subjectMap[entry.subject_id]?.name || "?"} (${c.name})`}
+                                        title={`${teacherMap[entry.teacher_id]?.name || "?"} — ${subjectMap[entry.subject_id]?.name || "?"} (${c.name})${conflict ? `\n⚠ ${conflictSnippet(conflict, teacherMap, classMap)}` : ""}`}
                                         conflict={conflict}
                                         dimmed={!cellMatchesFilter(entry)}
                                         onClear={() => clearSlot(entry.id)}
@@ -704,7 +755,7 @@ export default function ScheduleBuilder() {
                       {breakRow && (
                         <tr className="bg-amber-50/60">
                           <td className="p-1 sticky left-0 bg-amber-50 border-r border-slate-200 z-10"></td>
-                          {DAYS.map((day) => {
+                          {bandDays.map((day) => {
                             const breaks = breakRow[day] || [];
                             return (
                               <td key={day} colSpan={sortedClasses.length} className="p-1 border-l border-slate-200">
@@ -721,6 +772,8 @@ export default function ScheduleBuilder() {
                 })}
               </tbody>
             </table>
+          </div>
+          ))}
           </div>
           )}
         </div>

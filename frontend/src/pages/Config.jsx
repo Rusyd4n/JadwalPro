@@ -15,6 +15,11 @@ export default function Config() {
   const [drafts, setDrafts] = useState({});
   const [saving, setSaving] = useState(false);
   const [selectedDay, setSelectedDay] = useState("Monday");
+  const [classes, setClasses] = useState([]);
+
+  useEffect(() => {
+    api.get("/classes").then((r) => setClasses(r.data)).catch(() => {});
+  }, []);
   const [resetOpen, setResetOpen] = useState(false);
   const [confirmText, setConfirmText] = useState("");
   const [resetting, setResetting] = useState(false);
@@ -282,6 +287,39 @@ export default function Config() {
                       <Coffee size={14} className="mr-2" />
                       Tambah Istirahat
                     </Button>
+                  </div>
+
+                  <div className="mt-5 border-t border-slate-100 pt-4">
+                    <h4 className="text-sm font-semibold text-slate-900">Batas JP per kelas ({DAY_ID[d]})</h4>
+                    <p className="text-[11px] text-slate-500 mt-0.5 mb-2">
+                      Kosongkan = mengikuti jumlah JP hari ini ({draft.items.filter((i) => i.type === "period").length} JP).
+                      Mis. Jumat X-1/X-2 cukup 7 JP.
+                    </p>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                      {classes.map((c) => (
+                        <div key={c.id} className="flex items-center gap-2 border border-slate-200 rounded-md px-2 py-1.5">
+                          <span className="text-xs font-mono text-slate-600 flex-1 truncate" title={c.name}>{c.name}</span>
+                          <Input
+                            type="number"
+                            min={1}
+                            data-testid={`limit-${d}-${c.id}`}
+                            className="w-16 h-8 text-xs"
+                            placeholder="—"
+                            value={draft.class_limits?.[c.id] ?? ""}
+                            onChange={(e) => {
+                              const v = e.target.value === "" ? undefined : parseInt(e.target.value, 10);
+                              const lim = { ...(draft.class_limits || {}) };
+                              if (v == null || Number.isNaN(v)) delete lim[c.id];
+                              else lim[c.id] = v;
+                              setDrafts({ ...drafts, [d]: { ...draft, class_limits: lim } });
+                            }}
+                          />
+                        </div>
+                      ))}
+                      {classes.length === 0 && (
+                        <div className="text-xs text-slate-400 col-span-full">Belum ada data kelas.</div>
+                      )}
+                    </div>
                   </div>
                 </div>
 

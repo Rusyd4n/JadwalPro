@@ -105,6 +105,8 @@ class DayConfig(BaseModel):
     day: str
     start_time: str = "07:00"
     items: List[PeriodItem] = Field(default_factory=list)
+    # batas JP per kelas: {class_id: max_period} — mis. Jumat X-1/X-2 hanya 7 JP
+    class_limits: Dict[str, int] = Field(default_factory=dict)
 
 
 DEFAULT_ITEMS_REGULAR = [
@@ -156,6 +158,28 @@ async def get_valid_slots_by_day() -> Dict[str, set]:
         periods = [i for i in c.get("items", []) if i.get("type") == "period"]
         result[c["day"]] = set(range(1, len(periods) + 1))
     return result
+
+
+async def load_class_limits() -> Dict[str, Dict[str, int]]:
+    """Muat batas JP per kelas: {day: {class_id: max_period}}."""
+    await ensure_day_configs()
+    configs = await db.day_configs.find({}, {"_id": 0}).to_list(20)
+    out: Dict[str, Dict[str, int]] = {}
+    for c in configs:
+        lim = c.get("class_limits") or {}
+        if lim:
+            out[c["day"]] = {str(k): int(v) for k, v in lim.items()}
+    return out
+
+
+def valid_slots_for(valid_global: Dict[str, set], limits: Dict[str, Dict[str, int]],
+                    class_id: str, day: str) -> set:
+    """Slot valid untuk kelas tertentu (terapkan class_limits bila ada)."""
+    base = valid_global.get(day, set())
+    lim = (limits.get(day) or {}).get(class_id)
+    if lim is None:
+        return base
+    return {s for s in base if 1 <= s <= lim}
 
 
 async def get_breaks_after_map() -> Dict[str, set]:
@@ -1690,7 +1714,7 @@ def get_valid_slots(day: str) -> List[int]:
     return FRIDAY_SLOTS if day == "Friday" else REGULAR_SLOTS
 
 
-def detect_conflicts(schedule: List[dict], teachers: List[dict], valid_slots_by_day: Optional[Dict[str, set]] = None) -> List[dict]:
+def detect_conflicts(schedule: List[dict], teachers: List[dict], valid_slots_by_day: Optional[Dict[str, set]] = None, limits: Optional[Dict[str, Dict[str, int]]] = None) -> List[dict]:
     conflicts = []
     teacher_map = {t["id"]: t for t in teachers}
     # 1 & 3: teacher & class double-booked
@@ -1732,14 +1756,14 @@ def detect_conflicts(schedule: List[dict], teachers: List[dict], valid_slots_by_
                 "class_id": s["class_id"],
                 "message": f"{t['name']} tidak tersedia pada {s['day']} JP{s['slot']}"
             })
-        if valid_slots_by_day is not None:
-            valid = valid_slots_by_day.get(s["day"])
-            if valid is not None and s["slot"] not in valid:
+        if valid_slots_by_day is not None and s["day"] in valid_slots_by_day:
+            valid = valid_slots_for(valid_slots_by_day, limits or {}, s["class_id"], s["day"])
+            if s["slot"] not in valid:
                 conflicts.append({
                     "type": "invalid_slot",
                     "day": s["day"], "slot": s["slot"],
                     "class_id": s["class_id"],
-                    "message": f"{s['day']} JP{s['slot']} tidak ada dalam konfigurasi hari ini"
+                    "message": f"{s['day']} JP{s['slot']} di luar batas konfigurasi kelas ini"
                 })
     return conflicts
 
@@ -1764,14 +1788,15 @@ async def upsert_slot(payload: ScheduleSlot, request: Request, force: bool = Fal
     teacher_map = {t["id"]: t for t in teachers}
     class_map = {c["id"]: c for c in classes}
     valid_slots_by_day = await get_valid_slots_by_day()
+    limits = await load_class_limits()
 
     teacher = teacher_map.get(payload.teacher_id)
     tname = teacher["name"] if teacher else payload.teacher_id
-    valid = valid_slots_by_day.get(payload.day)
-    if valid is not None and payload.slot not in valid:
+    valid = valid_slots_for(valid_slots_by_day, limits, payload.class_id, payload.day)
+    if payload.day in valid_slots_by_day and payload.slot not in valid:
         raise HTTPException(status_code=409, detail={
             "code": "invalid_slot", "can_force": False,
-            "message": f"{payload.day} JP{payload.slot} tidak ada dalam konfigurasi hari ini",
+            "message": f"{payload.day} JP{payload.slot} di luar batas konfigurasi kelas ini",
         })
     clash = await db.schedule.find_one({
         "teacher_id": payload.teacher_id,
@@ -1820,7 +1845,8 @@ async def get_conflicts(request: Request):
     schedule = await load_all_schedule()
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
     valid = await get_valid_slots_by_day()
-    return detect_conflicts(schedule, teachers, valid)
+    limits = await load_class_limits()
+    return detect_conflicts(schedule, teachers, valid, limits)
 
 
 @api_router.post("/schedule/auto")
@@ -1832,9 +1858,10 @@ async def auto_schedule(request: Request):
     existing = await load_all_schedule()
     valid_slots_by_day = await get_valid_slots_by_day()
     breaks_after = await get_breaks_after_map()
+    limits = await load_class_limits()
 
     new_slots = _greedy_fill(assignments, {t["id"]: t for t in teachers}, existing, valid_slots_by_day,
-                             breaks_after)
+                             breaks_after, limits)
 
     if new_slots:
         await db.schedule.insert_many(new_slots)
@@ -1842,9 +1869,36 @@ async def auto_schedule(request: Request):
     return {"ok": True, "added": len(new_slots), "total_slots": total}
 
 
+def _split_blocks(n: int) -> List[int]:
+    """Pecah N JP menjadi blok 2/3: 1->[1], 4->[2,2], 5->[3,2], 6->[3,3], 7->[3,2,2]."""
+    blocks = []
+    while n > 4:
+        blocks.append(3)
+        n -= 3
+    if n == 4:
+        blocks.extend([2, 2])
+    elif n > 0:
+        blocks.append(n)
+    return blocks
+
+
+def _runs_of(slots_sorted: List[int], k: int, breaks: set) -> List[List[int]]:
+    """Semua run k slot bernomor urut tanpa menyeberangi break."""
+    out = []
+    for i in range(len(slots_sorted) - k + 1):
+        window = slots_sorted[i:i + k]
+        if any(window[j + 1] - window[j] != 1 for j in range(k - 1)):
+            continue
+        if any(p in breaks for p in window[:-1]):
+            continue
+        out.append(window)
+    return out
+
+
 def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
                  existing: List[dict], valid_slots_by_day: Dict[str, set],
-                 breaks_after: Optional[Dict[str, set]] = None) -> List[dict]:
+                 breaks_after: Optional[Dict[str, set]] = None,
+                 limits: Optional[Dict[str, Dict[str, int]]] = None) -> List[dict]:
     """Isi kekurangan JP secara greedy dengan menghormati occupancy + availability.
 
     Aturan blok: JP > 1 untuk (guru, mapel, kelas) yang sama WAJIB berurutan
@@ -1852,34 +1906,23 @@ def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
     Pembagian: 1->[1], 2->[2], 3->[3], 4->[2,2], 5->[3,2], 6->[3,3], 7->[3,2,2], dst.
     Bila blok tak muat di mana pun (ketersediaan terfragmentasi), JP blok itu
     dipasang satuan agar tidak ada jam yang hilang.
+    Sisa JP yang bahkan tak muat satuan bersih TETAP dipasang (force) dengan
+    pelanggaran minimal — selnya otomatis merah via detect_conflicts.
 
     Dipakai oleh /schedule/auto dan /schedule/rebuild (logika identik).
     """
     breaks_after = breaks_after or {}
+    limits = limits or {}
+
+    def valid_here(class_id: str, day: str) -> List[int]:
+        return sorted(valid_slots_for(valid_slots_by_day, limits, class_id, day))
 
     def split_blocks(n: int) -> List[int]:
-        blocks = []
-        while n > 4:
-            blocks.append(3)
-            n -= 3
-        if n == 4:
-            blocks.extend([2, 2])
-        elif n > 0:
-            blocks.append(n)
-        return blocks
+        return _split_blocks(n)
 
     def runs_of(slots_sorted: List[int], k: int, day: str) -> List[List[int]]:
         """Semua run k slot bernomor urut tanpa menyeberangi break."""
-        brk = breaks_after.get(day, set())
-        out = []
-        for i in range(len(slots_sorted) - k + 1):
-            window = slots_sorted[i:i + k]
-            if any(window[j + 1] - window[j] != 1 for j in range(k - 1)):
-                continue
-            if any(p in brk for p in window[:-1]):
-                continue
-            out.append(window)
-        return out
+        return _runs_of(slots_sorted, k, breaks_after.get(day, set()))
 
     # occupancy trackers
     class_slots: Dict[tuple, bool] = {}  # (class_id, day, slot) -> occupied
@@ -1890,9 +1933,11 @@ def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
 
     # existing hours placed per assignment
     placed_per_assignment: Dict[tuple, int] = {}  # (teacher, subject, class) -> count
+    triple_slots: Dict[tuple, set] = {}  # (teacher, subject, class) -> {(day, slot)}
     for s in existing:
         k = (s["teacher_id"], s["subject_id"], s["class_id"])
         placed_per_assignment[k] = placed_per_assignment.get(k, 0) + 1
+        triple_slots.setdefault(k, set()).add((s["day"], s["slot"]))
 
     # Sort assignments: those with more constrained teachers first
     def teacher_constraint_count(a):
@@ -1927,6 +1972,18 @@ def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
         teacher_slots[(a["teacher_id"], day, slot)] = True
         placed_box[0] += 1
 
+    def violation_score(a: dict, teacher: dict, day: str, slot: int,
+                        class_slots: dict, teacher_slots: dict) -> int:
+        """Skor pelanggaran bila dipasang paksa (0 = bersih)."""
+        score = 0
+        if teacher_slots.get((a["teacher_id"], day, slot)):
+            score += 10  # guru bentrok
+        if teacher.get("availability", {}).get(f"{day}-{slot}", "available") == "unavailable":
+            score += 5  # di luar availability
+        if class_slots.get((a["class_id"], day, slot)):
+            score += 7  # kelas terisi
+        return score
+
     new_slots = []
     for a in assignments_sorted:
         teacher = teacher_map.get(a["teacher_id"])
@@ -1938,16 +1995,22 @@ def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
         if needed <= 0:
             continue
         placed_box = [0]
+        key = (a["teacher_id"], a["subject_id"], a["class_id"])
+        taken = set(triple_slots.get(key, set()))  # slot triple ini (ada + baru), anti-dempet blok
         for k in split_blocks(needed):
             done = False
             if k > 1:
-                # cari run k slot berurutan di hari yang sama
+                # cari run k slot berurutan di hari yang sama, tak bersentuhan
+                # dengan slot triple-sama (agar run maks 3) dan tak menyeberangi break
                 for day in DAYS:
-                    valid = sorted(valid_slots_by_day.get(day, set()))
+                    valid = valid_here(a["class_id"], day)
                     for run in runs_of(valid, k, day):
+                        if (day, run[0] - 1) in taken or (day, run[-1] + 1) in taken:
+                            continue
                         if all(slot_free(a, teacher, day, s, class_slots, teacher_slots) for s in run):
                             for s in run:
                                 occupy(a, day, s, class_slots, teacher_slots, new_slots, placed_box)
+                                taken.add((day, s))
                             done = True
                             break
                     if done:
@@ -1956,7 +2019,7 @@ def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
                 # fallback: pasang satuan (first-fit) agar JP tidak hilang
                 for _ in range(k):
                     for day in DAYS:
-                        valid = sorted(valid_slots_by_day.get(day, set()))
+                        valid = valid_here(a["class_id"], day)
                         fitted = False
                         for slot in valid:
                             if slot_free(a, teacher, day, slot, class_slots, teacher_slots):
@@ -1965,7 +2028,149 @@ def _greedy_fill(assignments: List[dict], teacher_map: Dict[str, dict],
                                 break
                         if fitted:
                             break
+        short = needed - placed_box[0]
+        for _ in range(max(0, short)):
+            # FORCE: sisa JP wajib masuk tabel meski melanggar — pilih slot
+            # dengan skor pelanggaran terkecil (otomatis merah via detect_conflicts)
+            best = None
+            best_score = None
+            for day in DAYS:
+                for slot in valid_here(a["class_id"], day):
+                    sc = violation_score(a, teacher, day, slot, class_slots, teacher_slots)
+                    if best_score is None or sc < best_score:
+                        best_score = sc
+                        best = (day, slot)
+                        if sc == 0:
+                            break
+                if best_score == 0:
+                    break
+            if best is None:
+                break
+            occupy(a, best[0], best[1], class_slots, teacher_slots, new_slots, placed_box)
     return new_slots
+
+
+def solve_timetable_cpsat(assignments: List[dict], teacher_map: Dict[str, dict],
+                          valid_slots_by_day: Dict[str, set],
+                          breaks_after: Dict[str, set],
+                          time_limit_s: float = 60.0,
+                          limits: Optional[Dict[str, Dict[str, int]]] = None) -> dict:
+    """Optimasi jadwal global dengan Google OR-Tools CP-SAT (gratis, eksak).
+
+    - Tiap assignment dipecah jadi blok 2/3 JP (_split_blocks).
+    - Tiap blok WAJIB terpasang tepat sekali sebagai 1 run berurutan
+      (tak menyeberangi break) -> tidak ada slot tersisa.
+    - Bentrok guru, bentrok kelas, dan pelanggaran availability dimodelkan
+      sebagai penalti (100/100/10 per slot) yang diminimalkan.
+    - Penalti 0 + status OPTIMAL = solusi nol-konflik yang terbukti optimal.
+    """
+    from ortools.sat.python import cp_model
+
+    model = cp_model.CpModel()
+    # susun blok
+    blocks = []  # {teacher_id, subject_id, class_id, k}
+    for a in assignments:
+        need = int(a.get("hours_per_week") or 0)
+        if need <= 0 or a.get("teacher_id") not in teacher_map:
+            continue
+        for k in _split_blocks(need):
+            blocks.append({"teacher_id": a["teacher_id"], "subject_id": a["subject_id"],
+                           "class_id": a["class_id"], "k": k})
+
+    day_slots = {d: sorted(valid_slots_by_day.get(d, set())) for d in DAYS}
+    limits = limits or {}
+    day_slots_for = lambda cid, d: sorted(valid_slots_for(valid_slots_by_day, limits, cid, d))
+    y_vars = []  # (block_idx, day, run_tuple, var, unav_count)
+    cover_teacher: Dict[tuple, list] = {}  # (t,day,slot) -> [var]
+    cover_class: Dict[tuple, list] = {}  # (c,day,slot) -> [var]
+    obj_terms = []
+    for bi, b in enumerate(blocks):
+        teacher = teacher_map[b["teacher_id"]]
+        cands = []
+        for day in DAYS:
+            for run in _runs_of(day_slots_for(b["class_id"], day), b["k"], breaks_after.get(day, set())):
+                unav = sum(1 for s in run
+                           if teacher.get("availability", {}).get(f"{day}-{s}", "available") == "unavailable")
+                v = model.NewBoolVar(f"b{bi}_{day}_{run[0]}")
+                cands.append((day, tuple(run), v, unav))
+                for s in run:
+                    cover_teacher.setdefault((b["teacher_id"], day, s), []).append(v)
+                    cover_class.setdefault((b["class_id"], day, s), []).append(v)
+        if not cands:  # tak ada run valid untuk blok ini (konfigurasi ekstrem)
+            return {"status": "INFEASIBLE_MODEL", "entries": [], "penalty": None, "wall_time": 0.0}
+        model.Add(sum(v for _, _, v, _ in cands) == 1)
+        for day, run, v, unav in cands:
+            y_vars.append((bi, day, run, v, unav))
+            if unav:
+                obj_terms.append(unav * 10 * v)
+
+    # beban per sel -> penalti bentrok
+    for key, vs in cover_teacher.items():
+        load = sum(vs)
+        if len(vs) > 1:
+            over = model.NewIntVar(0, len(vs), f"ot_{key}")
+            model.Add(over >= load - 1)
+            obj_terms.append(100 * over)
+    for key, vs in cover_class.items():
+        load = sum(vs)
+        if len(vs) > 1:
+            over = model.NewIntVar(0, len(vs), f"oc_{key}")
+            model.Add(over >= load - 1)
+            obj_terms.append(100 * over)
+
+    model.Minimize(sum(obj_terms))
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = time_limit_s
+    solver.parameters.num_search_workers = 8
+    status = solver.Solve(model)
+    name = {cp_model.OPTIMAL: "OPTIMAL", cp_model.FEASIBLE: "FEASIBLE",
+            cp_model.INFEASIBLE: "INFEASIBLE", cp_model.UNKNOWN: "UNKNOWN"}.get(status, str(status))
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return {"status": name, "entries": [], "penalty": None, "wall_time": solver.WallTime()}
+
+    entries = []
+    for bi, day, run, v, _ in y_vars:
+        if solver.Value(v):
+            b = blocks[bi]
+            for s in run:
+                entries.append({"id": new_id("sch"), "class_id": b["class_id"], "day": day,
+                                "slot": s, "subject_id": b["subject_id"],
+                                "teacher_id": b["teacher_id"]})
+    return {"status": name, "entries": entries, "penalty": int(solver.ObjectiveValue()),
+            "wall_time": solver.WallTime()}
+
+
+@api_router.post("/schedule/optimize")
+async def optimize_schedule(request: Request, time_limit: float = 60.0):
+    """Regenerasi SELURUH jadwal dengan AI optimizer (OR-Tools CP-SAT).
+
+    Menjamin: semua JP terpasang (tak ada sisa) dengan total pelanggaran
+    minimal yang terbukti optimal. Jadwal lama diganti seluruhnya.
+    Query: ?time_limit=60 (detik, maks 300).
+    """
+    await require_user(request)
+    time_limit = max(5.0, min(float(time_limit or 60.0), 300.0))
+    teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
+    assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
+    valid_slots_by_day = await get_valid_slots_by_day()
+    breaks_after = await get_breaks_after_map()
+    limits = await load_class_limits()
+
+    result = solve_timetable_cpsat(assignments, {t["id"]: t for t in teachers},
+                                   valid_slots_by_day, breaks_after, time_limit, limits)
+    if not result["entries"]:
+        raise HTTPException(status_code=409, detail={
+            "code": "optimize_failed", "can_force": False,
+            "message": f"Optimizer gagal menemukan solusi (status {result['status']}). Jadwal tidak diubah.",
+        })
+    await db.schedule.delete_many({})
+    await db.schedule.insert_many(result["entries"])
+    schedule = await load_all_schedule()
+    conflicts = detect_conflicts(schedule, teachers, valid_slots_by_day, limits)
+    return {"ok": True, "placed": len(result["entries"]), "total_slots": len(schedule),
+            "solver_status": result["status"], "penalty": result["penalty"],
+            "wall_time": round(result["wall_time"], 1),
+            "conflicts_remaining": len(conflicts), "conflicts": conflicts}
 
 
 @api_router.post("/schedule/rebuild")
@@ -1974,13 +2179,15 @@ async def rebuild_schedule(request: Request):
 
     1. Hapus slot yang melanggar: guru double-booked (simpan 1, hapus sisanya),
        availability violation, dan invalid_slot.
-    2. Isi ulang kekurangan JP secara greedy (hormati availability terbaru).
+    2. Isi ulang kekurangan JP secara greedy berblok 2/3; sisa yang tak muat
+       bersih TETAP dipasang (pelanggaran minimal, merah) agar tak ada JP hilang.
     """
     await require_user(request)
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
     assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
     existing = await load_all_schedule()
     valid_slots_by_day = await get_valid_slots_by_day()
+    limits = await load_class_limits()
     teacher_map = {t["id"]: t for t in teachers}
 
     to_delete: List[str] = []
@@ -1999,7 +2206,8 @@ async def rebuild_schedule(request: Request):
         reason = None
         if t and t.get("availability", {}).get(f"{s['day']}-{s['slot']}") == "unavailable":
             reason = "availability_violation"
-        elif s["slot"] not in valid_slots_by_day.get(s["day"], set()):
+        elif s["day"] in valid_slots_by_day and s["slot"] not in valid_slots_for(
+                valid_slots_by_day, limits, s["class_id"], s["day"]):
             reason = "invalid_slot"
         if reason:
             to_delete.append(s["id"])
@@ -2012,12 +2220,12 @@ async def rebuild_schedule(request: Request):
 
     remaining = [s for s in existing if s["id"] not in set(to_delete)]
     breaks_after = await get_breaks_after_map()
-    new_slots = _greedy_fill(assignments, teacher_map, remaining, valid_slots_by_day, breaks_after)
+    new_slots = _greedy_fill(assignments, teacher_map, remaining, valid_slots_by_day, breaks_after, limits)
     if new_slots:
         await db.schedule.insert_many(new_slots)
     total = len(await load_all_schedule())
     schedule = await load_all_schedule()
-    conflicts = detect_conflicts(schedule, teachers, valid_slots_by_day)
+    conflicts = detect_conflicts(schedule, teachers, valid_slots_by_day, limits)
     return {"ok": True, "removed": len(to_delete), "removed_detail": removed_detail,
             "added": len(new_slots), "total_slots": total,
             "conflicts_remaining": len(conflicts)}
@@ -2032,7 +2240,8 @@ async def dashboard_stats(request: Request):
     schedule = await load_all_schedule()
     teachers = await db.teachers.find({}, {"_id": 0}).to_list(500)
     valid = await get_valid_slots_by_day()
-    conflicts = detect_conflicts(schedule, teachers, valid)
+    limits = await load_class_limits()
+    conflicts = detect_conflicts(schedule, teachers, valid, limits)
 
     # completion rate: placed_slots / required_slots from assignments
     assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
@@ -2159,6 +2368,14 @@ async def seed_data(request: Request):
             {"id": new_id("c"), "name": "XII-2", "grade": "XII"},
         ]
         await db.classes.insert_many(classes)
+        # Aturan sekolah: Jumat X-1/X-2 hanya 7 JP
+        await ensure_day_configs()
+        x_ids = [c["id"] for c in classes if c["name"] in ("X-1", "X-2")]
+        if x_ids:
+            await db.day_configs.update_one(
+                {"day": "Friday"},
+                {"$set": {"class_limits": {cid: 7 for cid in x_ids}}},
+            )
 
     if await db.subjects.count_documents({}) == 0:
         subjects = [
@@ -2276,11 +2493,24 @@ async def update_day_config(day: str, payload: dict, request: Request):
     if day not in DAYS:
         raise HTTPException(status_code=400, detail="Invalid day")
     existing = await db.day_configs.find_one({"day": day}, {"_id": 0})
+    limits = payload.get("class_limits", (existing or {}).get("class_limits", {})) or {}
+    # sanitasi: hanya class_id dikenal, 1..jumlah periode hari itu
+    period_n = sum(1 for i in payload.get("items", []) if isinstance(i, dict) and i.get("type") == "period")
+    clean_limits = {}
+    if isinstance(limits, dict):
+        for cid, v in limits.items():
+            try:
+                iv = int(v)
+            except (ValueError, TypeError):
+                continue
+            if 1 <= iv <= max(period_n, 1):
+                clean_limits[str(cid)] = iv
     doc = {
         "id": existing["id"] if existing else new_id("dcfg"),
         "day": day,
         "start_time": payload.get("start_time", "07:00"),
         "items": payload.get("items", []),
+        "class_limits": clean_limits,
     }
     await db.day_configs.update_one({"day": day}, {"$set": doc}, upsert=True)
     return doc
