@@ -13,7 +13,7 @@ function emptyAvailabilityFromConfigs(configs) {
   const av = {};
   configs.forEach((cfg) => {
     const count = cfg.items.filter((i) => i.type === "period").length;
-    for (let s = 1; s <= count; s++) av[`${cfg.day}-${s}`] = "available";
+    for (let s = 1; s <= count; s++) av[`${cfg.day}-${s}`] = "unavailable";
   });
   return av;
 }
@@ -21,15 +21,17 @@ function emptyAvailabilityFromConfigs(configs) {
 export default function Availability() {
   const { configs } = useConfig();
   const [teachers, setTeachers] = useState([]);
+  const [assignments, setAssignments] = useState([]);
   const [selectedId, setSelectedId] = useState("");
   const [availability, setAvailability] = useState({});
   const [dirty, setDirty] = useState(false);
 
   useEffect(() => {
     (async () => {
-      const r = await api.get("/teachers");
-      setTeachers(r.data);
-      if (r.data[0]) setSelectedId(r.data[0].id);
+      const [t, a] = await Promise.all([api.get("/teachers"), api.get("/assignments")]);
+      setTeachers(t.data);
+      setAssignments(a.data);
+      if (t.data[0]) setSelectedId(t.data[0].id);
     })();
   }, []);
 
@@ -66,11 +68,14 @@ export default function Availability() {
   };
 
   const selected = teachers.find((x) => x.id === selectedId);
+  const requiredJP = assignments.filter((a) => a.teacher_id === selectedId)
+    .reduce((s, a) => s + (a.hours_per_week || 0), 0);
   const availableCount = Object.entries(availability).filter(([k, v]) => {
     const [day, slotStr] = k.split("-");
     const slot = parseInt(slotStr, 10);
     return v === "available" && isSlotValid(configs, day, slot);
   }).length;
+  const shortfall = requiredJP - availableCount;
 
   return (
     <div className="p-8">
@@ -106,17 +111,23 @@ export default function Availability() {
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
             <div className="bg-white border border-slate-200 rounded-lg p-4">
               <div className="text-xs uppercase tracking-wide text-slate-500">Guru terpilih</div>
-              <div className="text-lg font-semibold mt-1">{selected.name}</div>
+              <div className="text-lg font-semibold mt-1">{selected.nomor ? `${selected.nomor}. ` : ""}{selected.name}</div>
             </div>
             <div className="bg-white border border-slate-200 rounded-lg p-4">
               <div className="text-xs uppercase tracking-wide text-slate-500">Slot tersedia</div>
               <div className="text-lg font-semibold mt-1 text-emerald-700">{availableCount} slot</div>
             </div>
             <div className="bg-white border border-slate-200 rounded-lg p-4">
-              <div className="text-xs uppercase tracking-wide text-slate-500">Maks JP/minggu</div>
-              <div className="text-lg font-semibold mt-1">{selected.max_hours_per_week}</div>
+              <div className="text-xs uppercase tracking-wide text-slate-500">Beban JP (Assignment)</div>
+              <div className="text-lg font-semibold mt-1">{requiredJP} JP</div>
             </div>
           </div>
+
+          {shortfall > 0 && (
+            <div className="mb-5 border-l-4 border-red-500 bg-red-50 p-3 text-sm text-red-900 rounded-r">
+              <strong>Kurang {shortfall} slot:</strong> beban {requiredJP} JP melebihi {availableCount} slot tersedia. Aktifkan lebih banyak sel hijau atau kurangi beban di Teaching Load.
+            </div>
+          )}
 
           {selected.notes && (
             <div className="mb-5 border-l-4 border-emerald-500 bg-emerald-50 p-3 text-sm text-emerald-900 rounded-r">

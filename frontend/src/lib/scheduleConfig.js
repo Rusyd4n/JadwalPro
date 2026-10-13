@@ -107,6 +107,10 @@ export function getBreakRow(configs, periodIdx) {
   return hasAny ? perDay : null;
 }
 
-export function isSlotValid(configs, day, slot) {
-  return slot >= 1 && slot <= periodCount(configs, day);
+export function isSlotValid(configs, day, slot, classId) {
+  const base = slot >= 1 && slot <= periodCount(configs, day);
+  if (!base || !classId) return base;
+  const lim = getConfigForDay(configs, day)?.class_limits?.[classId];
+  if (lim == null) return base;
+  return slot >= 1 && slot <= lim;
 }

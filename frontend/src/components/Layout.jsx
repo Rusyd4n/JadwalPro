@@ -1,7 +1,8 @@
+import { useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import {
   LayoutDashboard, Users, Calendar, ClipboardList, Grid3x3, Eye, LogOut,
-  GraduationCap, BookOpen, Users2, Settings2,
+  GraduationCap, BookOpen, Users2, Settings2, PanelLeftClose, PanelLeftOpen,
 } from "lucide-react";
 import api from "@/lib/api";
 import { Button } from "@/components/ui/button";
@@ -46,6 +47,16 @@ const NAV_GROUPS = [
 export default function Layout({ user, children }) {
   const navigate = useNavigate();
   const location = useLocation();
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return localStorage.getItem("jadwalpro_sidebar") === "collapsed"; } catch (e) { return false; }
+  });
+
+  const toggle = () => {
+    setCollapsed((v) => {
+      try { localStorage.setItem("jadwalpro_sidebar", v ? "expanded" : "collapsed"); } catch (e) { /* ignore */ }
+      return !v;
+    });
+  };
 
   const logout = async () => {
     try { await api.post("/auth/logout"); } catch (e) { /* ignore */ }
@@ -54,16 +65,25 @@ export default function Layout({ user, children }) {
 
   return (
     <div className="min-h-screen flex bg-slate-50">
-      <aside className="w-64 bg-slate-900 text-slate-100 flex flex-col shrink-0 no-print">
+      {!collapsed && (
+      <aside className="w-64 bg-slate-900 text-slate-100 flex flex-col shrink-0 no-print sticky top-0 h-screen overflow-y-auto">
         <div className="px-6 pt-6 pb-4 border-b border-slate-800">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-md bg-emerald-500 flex items-center justify-center">
               <GraduationCap size={20} className="text-white" />
             </div>
-            <div>
+            <div className="flex-1 min-w-0">
               <div className="text-white font-semibold tracking-tight">JadwalPro</div>
               <div className="text-[11px] text-slate-400">MA Persis Katapang</div>
             </div>
+            <button
+              data-testid="toggle-sidebar-btn"
+              onClick={toggle}
+              title="Sembunyikan menu"
+              className="p-1.5 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors duration-150"
+            >
+              <PanelLeftClose size={16} />
+            </button>
           </div>
         </div>
         <nav className="flex-1 py-3 px-3 space-y-3 overflow-y-auto">
@@ -118,6 +138,17 @@ export default function Layout({ user, children }) {
           </Button>
         </div>
       </aside>
+      )}
+      {collapsed && (
+        <button
+          data-testid="expand-sidebar-btn"
+          onClick={toggle}
+          title="Tampilkan menu"
+          className="no-print fixed top-4 left-4 z-40 p-2 rounded-md bg-slate-900 text-slate-200 shadow-lg hover:text-white hover:bg-slate-800 transition-colors duration-150"
+        >
+          <PanelLeftOpen size={16} />
+        </button>
+      )}
       <main className="flex-1 overflow-x-hidden print-container">{children}</main>
     </div>
   );

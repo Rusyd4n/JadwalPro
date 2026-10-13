@@ -5,8 +5,9 @@ import { useConfig, computeTimeline } from "@/lib/scheduleConfig";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Plus, Trash2, ArrowUp, ArrowDown, Save, Coffee, Sparkles, RotateCcw } from "lucide-react";
+import { Plus, Trash2, ArrowUp, ArrowDown, Save, Coffee, Sparkles, RotateCcw, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 
 export default function Config() {
@@ -14,6 +15,14 @@ export default function Config() {
   const [drafts, setDrafts] = useState({});
   const [saving, setSaving] = useState(false);
   const [selectedDay, setSelectedDay] = useState("Monday");
+  const [classes, setClasses] = useState([]);
+
+  useEffect(() => {
+    api.get("/classes").then((r) => setClasses(r.data)).catch(() => {});
+  }, []);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [resetting, setResetting] = useState(false);
 
   useEffect(() => {
     const map = {};
@@ -97,6 +106,24 @@ export default function Config() {
       await refresh();
     } catch (e) {
       toast.error("Gagal menerapkan");
+    }
+  };
+
+  const resetAll = async () => {
+    if (confirmText !== "HAPUS SEMUA") return;
+    setResetting(true);
+    try {
+      const res = await api.post("/reset-all", {});
+      const d = res.data.deleted || {};
+      const total = Object.values(d).reduce((n, v) => n + (v || 0), 0);
+      toast.success(`Semua data dihapus (${total} dokumen: ${Object.entries(d).map(([k, v]) => `${k} ${v}`).join(", ")})`);
+      setResetOpen(false);
+      setConfirmText("");
+      await refresh();
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Gagal menghapus semua data");
+    } finally {
+      setResetting(false);
     }
   };
 
@@ -261,6 +288,39 @@ export default function Config() {
                       Tambah Istirahat
                     </Button>
                   </div>
+
+                  <div className="mt-5 border-t border-slate-100 pt-4">
+                    <h4 className="text-sm font-semibold text-slate-900">Batas JP per kelas ({DAY_ID[d]})</h4>
+                    <p className="text-[11px] text-slate-500 mt-0.5 mb-2">
+                      Kosongkan = mengikuti jumlah JP hari ini ({draft.items.filter((i) => i.type === "period").length} JP).
+                      Mis. Jumat X-1/X-2 cukup 7 JP.
+                    </p>
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                      {classes.map((c) => (
+                        <div key={c.id} className="flex items-center gap-2 border border-slate-200 rounded-md px-2 py-1.5">
+                          <span className="text-xs font-mono text-slate-600 flex-1 truncate" title={c.name}>{c.name}</span>
+                          <Input
+                            type="number"
+                            min={1}
+                            data-testid={`limit-${d}-${c.id}`}
+                            className="w-16 h-8 text-xs"
+                            placeholder="—"
+                            value={draft.class_limits?.[c.id] ?? ""}
+                            onChange={(e) => {
+                              const v = e.target.value === "" ? undefined : parseInt(e.target.value, 10);
+                              const lim = { ...(draft.class_limits || {}) };
+                              if (v == null || Number.isNaN(v)) delete lim[c.id];
+                              else lim[c.id] = v;
+                              setDrafts({ ...drafts, [d]: { ...draft, class_limits: lim } });
+                            }}
+                          />
+                        </div>
+                      ))}
+                      {classes.length === 0 && (
+                        <div className="text-xs text-slate-400 col-span-full">Belum ada data kelas.</div>
+                      )}
+                    </div>
+                  </div>
                 </div>
 
                 <aside className="bg-white border border-slate-200 rounded-lg p-4 h-fit">
@@ -293,6 +353,63 @@ export default function Config() {
           );
         })}
       </Tabs>
+
+      <div data-testid="danger-zone" className="mt-8 bg-white border-2 border-red-200 rounded-lg p-5">
+        <div className="flex items-start gap-3">
+          <div className="w-10 h-10 rounded-md bg-red-100 text-red-600 flex items-center justify-center shrink-0">
+            <AlertTriangle size={18} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <h3 className="font-semibold text-red-900">Zona Berbahaya</h3>
+            <p className="text-xs text-slate-500 mt-1">
+              Hapus <strong>seluruh data input</strong>: guru, mata pelajaran, kelas, penugasan, dan jadwal.
+              Akun login & konfigurasi hari tidak ikut terhapus. Tindakan ini tidak dapat dibatalkan.
+            </p>
+          </div>
+          <Button
+            data-testid="reset-all-btn"
+            onClick={() => { setConfirmText(""); setResetOpen(true); }}
+            className="bg-red-600 hover:bg-red-700 text-white shrink-0"
+          >
+            <Trash2 size={14} className="mr-2" /> Hapus Semua Data
+          </Button>
+        </div>
+      </div>
+
+      <Dialog open={resetOpen} onOpenChange={setResetOpen}>
+        <DialogContent className="bg-white max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-red-700">Hapus Semua Data?</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 py-2 text-sm text-slate-600">
+            <p>
+              Ini akan menghapus <strong>semua</strong> guru, mapel, kelas, penugasan, dan jadwal.
+              Ketik <code className="px-1.5 py-0.5 bg-slate-100 rounded font-mono text-xs">HAPUS SEMUA</code> untuk
+              mengonfirmasi.
+            </p>
+            <div>
+              <Label>Konfirmasi</Label>
+              <Input
+                data-testid="reset-all-confirm-input"
+                value={confirmText}
+                onChange={(e) => setConfirmText(e.target.value)}
+                placeholder="HAPUS SEMUA"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setResetOpen(false)}>Batal</Button>
+            <Button
+              data-testid="reset-all-confirm-btn"
+              onClick={resetAll}
+              disabled={confirmText !== "HAPUS SEMUA" || resetting}
+              className="bg-red-600 hover:bg-red-700 text-white disabled:opacity-40"
+            >
+              {resetting ? "Menghapus..." : "Ya, Hapus Semua"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
