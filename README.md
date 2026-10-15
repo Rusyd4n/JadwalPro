@@ -6,6 +6,16 @@ Menyelesaikan penjadwalan sekolah dengan constraint ketersediaan guru yang kompl
 dilengkapi auto-scheduler greedy, AI optimizer (OR-Tools CP-SAT), impor terpadu sekali-upload,
 backup/restore, dan ekspor PDF.
 
+## Tampilan Aplikasi
+
+| Login | Dashboard |
+|---|---|
+| ![Login](docs/screenshots/01-login.png) | ![Dashboard](docs/screenshots/02-dashboard.png) |
+
+| Jadwal Master | Availability Matrix |
+|---|---|
+| ![Jadwal Master](docs/screenshots/03-master-view.png) | ![Availability Matrix](docs/screenshots/04-availability-matrix.png) |
+
 ## Fitur Utama
 
 | Modul | Halaman | Keterangan |
